@@ -52,6 +52,8 @@ from telethon.tl.types import chatlists as chatlist_types
 SESSION_FILE = "heartvault"
 STATE_FILE = ".heartvault_state.json"
 MAX_FLOOD_WAIT = 15 * 60
+# Only videos at or below this size are backed up; larger ones are skipped.
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
 # 512 KiB parts evenly divide Telegram's 1 MiB block and satisfy the upload
 # 512 KiB part limit, so the same size works for parallel download and upload.
 PART_SIZE = 512 * 1024
@@ -111,6 +113,7 @@ class BackupResult:
     invite_link: str | None = None
     copied: int = 0
     failed: int = 0
+    skipped: int = 0
     error: str | None = None
 
 
@@ -550,6 +553,20 @@ async def close_transfer_senders(senders: list[Any]) -> None:
             pass
 
 
+def video_size(message: types.Message) -> int:
+    document = getattr(cast(Any, message), "document", None)
+    return int(getattr(document, "size", 0) or 0)
+
+
+def human_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
 def document_filename(document: Any, message_id: int) -> str:
     for attribute in getattr(document, "attributes", None) or []:
         name = getattr(attribute, "file_name", None)
@@ -893,6 +910,14 @@ async def backup_chat(
             ):
                 if not message.video or message.id in copied_ids:
                     continue
+                size = video_size(message)
+                if size > MAX_VIDEO_BYTES:
+                    result.skipped += 1
+                    console.print(
+                        f"  [yellow]⤼[/yellow] video [bold]#{message.id}[/bold] "
+                        f"skipped ({human_size(size)} > 100 MB)"
+                    )
+                    continue
                 try:
                     mode = await copy_video(
                         client, source, destination, message, temp_dir
@@ -917,7 +942,8 @@ async def backup_chat(
 
     console.print(
         f"[bold]Finished:[/bold] {result.copied} new · "
-        f"{len(copied_ids)} total · {result.failed} failed"
+        f"{len(copied_ids)} total · {result.skipped} skipped · "
+        f"{result.failed} failed"
     )
     return result
 
@@ -1003,6 +1029,7 @@ def show_summary(results: list[BackupResult], folder_title: str, link: str) -> b
     table.add_column("Source")
     table.add_column("Private backup")
     table.add_column("New", justify="right")
+    table.add_column("Skipped", justify="right")
     table.add_column("Failed", justify="right")
     table.add_column("Status")
     for result in results:
@@ -1010,6 +1037,7 @@ def show_summary(results: list[BackupResult], folder_title: str, link: str) -> b
             escape(result.source_title),
             escape(result.backup_title) if result.destination else "Not created",
             str(result.copied),
+            str(result.skipped),
             str(result.failed),
             result_status(result),
         )
