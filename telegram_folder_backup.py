@@ -6,6 +6,8 @@ import asyncio
 import getpass
 import inspect
 import json
+import math
+import os
 import re
 import tempfile
 import unicodedata
@@ -30,9 +32,12 @@ from rich.progress import (
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
-from telethon import TelegramClient, types, utils
+from telethon import TelegramClient, helpers, types, utils
 from telethon.errors import (
+    ChatForwardsRestrictedError,
+    FileReferenceExpiredError,
     FloodWaitError,
+    MediaEmptyError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
@@ -41,11 +46,20 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 from telethon.tl.functions import channels, chatlists, messages
+from telethon.tl.functions.upload import GetFileRequest, SaveBigFilePartRequest
 from telethon.tl.types import chatlists as chatlist_types
 
 SESSION_FILE = "heartvault"
 STATE_FILE = ".heartvault_state.json"
 MAX_FLOOD_WAIT = 15 * 60
+# 512 KiB parts evenly divide Telegram's 1 MiB block and satisfy the upload
+# 512 KiB part limit, so the same size works for parallel download and upload.
+PART_SIZE = 512 * 1024
+MAX_UPLOAD_PARTS = 4000
+# Extra connections opened per transfer. Each connection gets its own slice of
+# the file, so throughput scales roughly linearly with this until bandwidth or
+# Telegram throttling is the limit.
+MAX_TRANSFER_CONNECTIONS = 8
 HEART = "💗"
 TITLE_SUFFIX = f" ~ {HEART}"
 SMALL_CAPS = str.maketrans(
@@ -502,55 +516,252 @@ def transfer_progress() -> Progress:
     )
 
 
+def connection_count(size: int) -> int:
+    override = os.environ.get("HEARTVAULT_CONNECTIONS")
+    if override and override.isdigit() and int(override) > 0:
+        return min(MAX_TRANSFER_CONNECTIONS * 2, int(override))
+    if size <= 0:
+        return 1
+    # Roughly one connection per 16 MiB, bounded to a safe range.
+    scaled = math.ceil(size / (16 * 1024 * 1024))
+    return max(2, min(MAX_TRANSFER_CONNECTIONS, scaled))
+
+
+async def open_transfer_senders(
+    client: TelegramClient, dc_id: int, count: int
+) -> list[Any]:
+    # Exported senders must be created one at a time: creation temporarily
+    # mutates a shared init request, so concurrent creation would race.
+    senders: list[Any] = []
+    try:
+        for _ in range(count):
+            senders.append(await client._create_exported_sender(dc_id))
+    except Exception:
+        await close_transfer_senders(senders)
+        raise
+    return senders
+
+
+async def close_transfer_senders(senders: list[Any]) -> None:
+    for sender in senders:
+        try:
+            await sender.disconnect()
+        except Exception:
+            pass
+
+
+def document_filename(document: Any, message_id: int) -> str:
+    for attribute in getattr(document, "attributes", None) or []:
+        name = getattr(attribute, "file_name", None)
+        if name:
+            return name
+    return f"video_{message_id}.mp4"
+
+
+async def parallel_download(
+    client: TelegramClient,
+    document: Any,
+    dest_path: Path,
+    progress: Callable[[int, int], None],
+) -> None:
+    """Download one file over several connections, each fetching its own slice."""
+    dc_id, location = utils.get_input_location(document)
+    size = int(document.size)
+    total_parts = math.ceil(size / PART_SIZE)
+    count = min(connection_count(size), total_parts) or 1
+    senders = await open_transfer_senders(client, dc_id, count)
+    file_descriptor = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.ftruncate(file_descriptor, size)
+    done = 0
+    lock = asyncio.Lock()
+
+    async def worker(start: int, sender: Any) -> None:
+        nonlocal done
+        part = start
+        while part < total_parts:
+            offset = part * PART_SIZE
+            result = await client._call(
+                sender, GetFileRequest(location, offset=offset, limit=PART_SIZE)
+            )
+            chunk = getattr(result, "bytes", b"")
+            if chunk:
+                os.pwrite(file_descriptor, chunk, offset)
+                async with lock:
+                    done += len(chunk)
+                    progress(done, size)
+            part += count
+
+    try:
+        await asyncio.gather(
+            *(worker(index, sender) for index, sender in enumerate(senders))
+        )
+    finally:
+        os.close(file_descriptor)
+        await close_transfer_senders(senders)
+
+
+async def parallel_upload(
+    client: TelegramClient,
+    file_path: Path,
+    size: int,
+    name: str,
+    progress: Callable[[int, int], None],
+) -> types.InputFileBig:
+    """Upload one file over several connections and return its big-file handle."""
+    total_parts = math.ceil(size / PART_SIZE)
+    count = min(connection_count(size), total_parts) or 1
+    file_id = helpers.generate_random_long()
+    senders = await open_transfer_senders(
+        client, int(cast(Any, client.session).dc_id), count
+    )
+    file_descriptor = os.open(file_path, os.O_RDONLY)
+    done = 0
+    lock = asyncio.Lock()
+
+    async def worker(start: int, sender: Any) -> None:
+        nonlocal done
+        part = start
+        while part < total_parts:
+            offset = part * PART_SIZE
+            chunk = os.pread(file_descriptor, PART_SIZE, offset)
+            await client._call(
+                sender,
+                SaveBigFilePartRequest(
+                    file_id=file_id,
+                    file_part=part,
+                    file_total_parts=total_parts,
+                    bytes=chunk,
+                ),
+            )
+            async with lock:
+                done += len(chunk)
+                progress(done, size)
+            part += count
+
+    try:
+        await asyncio.gather(
+            *(worker(index, sender) for index, sender in enumerate(senders))
+        )
+    finally:
+        os.close(file_descriptor)
+        await close_transfer_senders(senders)
+    return types.InputFileBig(id=file_id, parts=total_parts, name=name)
+
+
 async def copy_video(
     client: TelegramClient,
     source: types.Chat | types.Channel,
     destination: Any,
     message: types.Message,
     temp_dir: Path,
-) -> None:
+) -> str:
+    caption = video_caption(message.id)
+
+    # Fast path: reuse Telegram's existing file reference so the server copies
+    # the video by pointer. No bytes are downloaded or uploaded, so it is
+    # near-instant and byte-for-byte identical to the original.
+    try:
+        await rpc_call(
+            f"copy video #{message.id}",
+            lambda: client.send_file(
+                destination,
+                file=cast(Any, message.media),
+                caption=caption,
+                supports_streaming=True,
+            ),
+            retry_server_errors=False,
+        )
+        return "linked"
+    except (
+        ChatForwardsRestrictedError,
+        MediaEmptyError,
+        FileReferenceExpiredError,
+    ):
+        # Protected or stale reference: fall back to a full re-download/upload.
+        pass
+
+    document = cast(Any, message).document
+    if document is None:
+        raise RuntimeError("The protected video message has no document to copy.")
+
+    size = int(getattr(document, "size", 0) or 0)
     source_name = utils.get_display_name(source) or "source"
+    file_name = document_filename(document, message.id)
+    media_path = temp_dir / f"{message.id}_{file_name}"
+
     with transfer_progress() as progress:
         task = progress.add_task(
             f"Download · {escape(source_name)} · #{message.id}",
-            total=None,
+            total=size or None,
         )
 
-        def download_callback(current: int, total: int) -> None:
-            progress.update(task, completed=current, total=total)
+        def on_progress(current: int, total: int) -> None:
+            progress.update(task, completed=current, total=total or None)
 
-        downloaded = await rpc_call(
-            f"download video #{message.id}",
-            lambda: client.download_media(
-                message,
-                file=str(temp_dir),
-                progress_callback=download_callback,
-            ),
-        )
-        if not downloaded or isinstance(downloaded, bytes):
-            raise RuntimeError("Telegram returned no downloaded file path.")
-
-        media_path = Path(downloaded)
-        progress.reset(task, description="Upload · original quality", total=None)
-
-        def upload_callback(current: int, total: int) -> None:
-            progress.update(task, completed=current, total=total)
-
-        try:
+        if size > 0:
             await rpc_call(
-                f"upload video #{message.id}",
-                lambda: client.send_file(
-                    destination,
-                    file=str(media_path),
-                    caption=video_caption(message.id),
-                    force_document=False,
-                    supports_streaming=True,
-                    progress_callback=upload_callback,
-                ),
+                f"download video #{message.id}",
+                lambda: parallel_download(client, document, media_path, on_progress),
                 retry_server_errors=False,
             )
+        else:
+            downloaded = await rpc_call(
+                f"download video #{message.id}",
+                lambda: client.download_media(
+                    message,
+                    file=str(media_path),
+                    progress_callback=on_progress,
+                ),
+            )
+            if not downloaded or isinstance(downloaded, bytes):
+                raise RuntimeError("Telegram returned no downloaded file path.")
+            media_path = Path(downloaded)
+
+        actual_size = media_path.stat().st_size
+        progress.reset(
+            task,
+            description=f"Upload · #{message.id}",
+            total=actual_size or None,
+        )
+
+        total_parts = math.ceil(actual_size / PART_SIZE) if actual_size else 0
+        try:
+            if 0 < actual_size and total_parts <= MAX_UPLOAD_PARTS:
+                input_file = await rpc_call(
+                    f"upload video #{message.id}",
+                    lambda: parallel_upload(
+                        client, media_path, actual_size, file_name, on_progress
+                    ),
+                    retry_server_errors=False,
+                )
+                # Streaming/duration/resolution are preserved by reusing the
+                # source document's own attributes.
+                media = types.InputMediaUploadedDocument(
+                    file=input_file,
+                    mime_type=document.mime_type or "video/mp4",
+                    attributes=list(document.attributes),
+                )
+                await rpc_call(
+                    f"send video #{message.id}",
+                    lambda: client.send_file(destination, file=media, caption=caption),
+                    retry_server_errors=False,
+                )
+            else:
+                await rpc_call(
+                    f"upload video #{message.id}",
+                    lambda: client.send_file(
+                        destination,
+                        file=str(media_path),
+                        caption=caption,
+                        force_document=False,
+                        supports_streaming=True,
+                        progress_callback=on_progress,
+                    ),
+                    retry_server_errors=False,
+                )
         finally:
             media_path.unlink(missing_ok=True)
+        return "reuploaded"
 
 
 async def destination_video_ids(client: TelegramClient, destination: Any) -> set[int]:
@@ -683,13 +894,16 @@ async def backup_chat(
                 if not message.video or message.id in copied_ids:
                     continue
                 try:
-                    await copy_video(client, source, destination, message, temp_dir)
+                    mode = await copy_video(
+                        client, source, destination, message, temp_dir
+                    )
                     copied_ids.add(message.id)
                     record["copied_message_ids"] = sorted(copied_ids)
                     state.save()
                     result.copied += 1
+                    tag = "linked" if mode == "linked" else "re-uploaded"
                     console.print(
-                        f"  [green]✓[/green] video [bold]#{message.id}[/bold] copied"
+                        f"  [green]✓[/green] video [bold]#{message.id}[/bold] {tag}"
                     )
                 except (OSError, RPCError, RuntimeError) as error:
                     result.failed += 1
