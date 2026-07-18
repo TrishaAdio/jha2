@@ -45,7 +45,13 @@ from telethon.errors import (
     ServerError,
     SessionPasswordNeededError,
 )
-from telethon.tl.functions import channels, chatlists, messages
+from telethon.network import MTProtoSender
+from telethon.tl.alltlobjects import LAYER
+from telethon.tl.functions import InvokeWithLayerRequest, channels, chatlists, messages
+from telethon.tl.functions.auth import (
+    ExportAuthorizationRequest,
+    ImportAuthorizationRequest,
+)
 from telethon.tl.functions.upload import GetFileRequest, SaveBigFilePartRequest
 from telethon.tl.types import chatlists as chatlist_types
 
@@ -533,12 +539,49 @@ def connection_count(size: int) -> int:
 async def open_transfer_senders(
     client: TelegramClient, dc_id: int, count: int
 ) -> list[Any]:
-    # Exported senders must be created one at a time: creation temporarily
-    # mutates a shared init request, so concurrent creation would race.
+    """Open several MTProto connections to ``dc_id`` for parallel transfer.
+
+    Auth handling mirrors the well-known FastTelethon approach:
+    - When ``dc_id`` is the client's own DC, reuse the existing auth key and
+      never call ``ExportAuthorizationRequest`` (Telegram rejects exporting
+      authorization for the DC you are already connected to).
+    - For a foreign DC, export/import authorization once for the first
+      connection, then share that authorized key with the rest.
+    Senders are created one at a time because the first foreign export
+    temporarily mutates the shared init request.
+    """
+    internal = cast(Any, client)
+    dc = await client._get_dc(dc_id)
+    same_dc = dc_id == int(cast(Any, client.session).dc_id)
+    auth_key = cast(Any, client.session).auth_key if same_dc else None
+
     senders: list[Any] = []
     try:
         for _ in range(count):
-            senders.append(await client._create_exported_sender(dc_id))
+            sender = MTProtoSender(auth_key, loggers=internal._log)
+            await sender.connect(
+                internal._connection(
+                    dc.ip_address,
+                    dc.port,
+                    dc.id,
+                    loggers=internal._log,
+                    proxy=internal._proxy,
+                    local_addr=internal._local_addr,
+                )
+            )
+            if auth_key is None:
+                # First connection to a foreign DC: authorize it, then reuse
+                # the resulting key for every subsequent connection.
+                exported = cast(Any, await client(ExportAuthorizationRequest(dc_id)))
+                internal._init_request.query = ImportAuthorizationRequest(
+                    id=exported.id, bytes=exported.bytes
+                )
+                await cast(
+                    Any,
+                    sender.send(InvokeWithLayerRequest(LAYER, internal._init_request)),
+                )
+                auth_key = sender.auth_key
+            senders.append(sender)
     except Exception:
         await close_transfer_senders(senders)
         raise
