@@ -965,15 +965,21 @@ async def call_part(
             if wait_for > MAX_FLOOD_WAIT:
                 raise
             await asyncio.sleep(wait_for)
-        except TRANSIENT_TRANSFER_ERRORS:
-            attempt += 1
-            if attempt >= PART_RETRIES:
+            continue
+        except TRANSIENT_TRANSFER_ERRORS as error:
+            last_error: Exception = error
+        except ValueError as error:
+            # Telethon raises this after its own internal retries give up
+            # during a transient DC outage; treat it as retryable.
+            if "Request was unsuccessful" not in str(error):
                 raise
-            delay = min(2**attempt, 15)
-            console.log(
-                f"[dim]{escape(label)}: transient error, retry in {delay}s[/dim]"
-            )
-            await asyncio.sleep(delay)
+            last_error = error
+        attempt += 1
+        if attempt >= PART_RETRIES:
+            raise last_error
+        delay = min(2**attempt, 15)
+        console.log(f"[dim]{escape(label)}: transient error, retry in {delay}s[/dim]")
+        await asyncio.sleep(delay)
 
 
 async def parallel_download(
@@ -1456,7 +1462,9 @@ async def copy_videos_pooled(
                 console.print(
                     f"  [green]✓[/green] video [bold]#{message_id}[/bold] {tag}{suffix}"
                 )
-            except (OSError, RPCError, RuntimeError) as error:
+            except Exception as error:
+                # Never let one video stop the whole run; count it as failed so
+                # it is retried on the next resumable run.
                 async with lock:
                     result.failed += 1
                 console.print(
@@ -1635,14 +1643,28 @@ async def run() -> bool:
         with tempfile.TemporaryDirectory(prefix="heartvault-") as temp:
             temp_dir = Path(temp)
             for index, source in enumerate(imported.chats, start=1):
-                result = await backup_chat(
-                    active_pool,
-                    source,
-                    index,
-                    len(imported.chats),
-                    temp_dir,
-                    state,
-                )
+                try:
+                    result = await backup_chat(
+                        active_pool,
+                        source,
+                        index,
+                        len(imported.chats),
+                        temp_dir,
+                        state,
+                    )
+                except (OSError, RPCError, RuntimeError, ValueError) as error:
+                    # One chat's failure must not abort the whole backup.
+                    title = utils.get_display_name(source) or "chat"
+                    console.print(
+                        f"[red]Chat '{escape(title)}' stopped: "
+                        f"{escape(str(error))}[/red]"
+                    )
+                    result = BackupResult(
+                        source_title=title,
+                        backup_title=backup_chat_title(title),
+                        destination=None,
+                        error=str(error),
+                    )
                 results.append(result)
 
         destinations = [
