@@ -9,5 +9,9 @@ __pycache__/
 *.py[cod]
 .venv/
 
+# Worker sessions
+heartvault_worker*.session
+heartvault_worker*.session-journal
+
 # Local temporary media
 heartvault-*/

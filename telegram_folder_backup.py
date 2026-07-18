@@ -41,10 +41,13 @@ from telethon.errors import (
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
     RPCError,
     ServerError,
     SessionPasswordNeededError,
     TimedOutError,
+    UserAlreadyParticipantError,
 )
 from telethon.network import MTProtoSender
 from telethon.tl.alltlobjects import LAYER
@@ -116,6 +119,14 @@ SMALL_CAPS = str.maketrans(
 
 console = Console()
 T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class Session:
+    """One logged-in account participating in the backup (main or worker)."""
+
+    client: TelegramClient
+    label: str
 
 
 @dataclass(slots=True)
@@ -321,7 +332,31 @@ async def finish_otp_login(client: TelegramClient, phone: str) -> None:
             return
 
 
-async def authenticate() -> TelegramClient:
+async def login_client(
+    session_name: str, api_id: int, api_hash: str, role: str
+) -> TelegramClient:
+    session_path = Path(__file__).resolve().parent / session_name
+    client = TelegramClient(str(session_path), api_id, api_hash)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        phone = Prompt.ask(
+            f"[bright_cyan]{role} phone number[/bright_cyan]", default="+"
+        )
+        await rpc_call("send login code", lambda: client.send_code_request(phone))
+        await finish_otp_login(client, phone)
+
+    me = await client.get_me()
+    if me is None:
+        raise RuntimeError(f"{role} login succeeded but returned no user profile.")
+    display_name = utils.get_display_name(me) or str(getattr(me, "id", "unknown"))
+    console.print(
+        f"[green]{role} connected as[/green] [bold]{escape(display_name)}[/bold]"
+    )
+    return client
+
+
+async def authenticate() -> tuple[TelegramClient, int, str]:
     console.print("\n[bold bright_magenta]Login[/bold bright_magenta]")
     api_id_text = Prompt.ask("[bright_cyan]API ID[/bright_cyan]").strip()
     if not api_id_text.isdigit():
@@ -334,21 +369,30 @@ async def authenticate() -> TelegramClient:
             "API Hash must be the 32-character value from my.telegram.org."
         )
 
-    session_path = Path(__file__).resolve().parent / SESSION_FILE
-    client = TelegramClient(str(session_path), api_id, api_hash)
-    await client.connect()
+    client = await login_client(SESSION_FILE, api_id, api_hash, "Main")
+    return client, api_id, api_hash
 
-    if not await client.is_user_authorized():
-        phone = Prompt.ask("[bright_cyan]Phone number[/bright_cyan]", default="+")
-        await rpc_call("send login code", lambda: client.send_code_request(phone))
-        await finish_otp_login(client, phone)
 
-    me = await client.get_me()
-    if me is None:
-        raise RuntimeError("Telegram login succeeded but returned no user profile.")
-    display_name = utils.get_display_name(me) or str(getattr(me, "id", "unknown"))
-    console.print(f"[green]Connected as[/green] [bold]{escape(display_name)}[/bold]")
-    return client
+async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[Session]:
+    """Log in extra accounts that share the workload. They reuse the main
+    application's API credentials; each just needs its own phone/OTP once,
+    after which the session persists to disk."""
+    workers: list[Session] = []
+    for number in range(1, count + 1):
+        console.print(
+            f"\n[bold bright_magenta]Worker {number} login[/bold bright_magenta]"
+        )
+        try:
+            client = await login_client(
+                f"{SESSION_FILE}_worker{number}", api_id, api_hash, f"Worker {number}"
+            )
+        except (RPCError, RuntimeError, ValueError) as error:
+            console.print(
+                f"[yellow]Worker {number} skipped ({escape(str(error))}).[/yellow]"
+            )
+            continue
+        workers.append(Session(client=client, label=f"w{number}"))
+    return workers
 
 
 def peer_entity_map(
@@ -462,6 +506,98 @@ async def import_shared_folder(client: TelegramClient, slug: str) -> ImportedFol
         f"· {len(accessible)} source chat(s)"
     )
     return ImportedFolder(title=title, chats=accessible)
+
+
+def to_peer(entity: Any) -> Any:
+    if isinstance(entity, types.Channel):
+        return types.PeerChannel(entity.id)
+    if isinstance(entity, types.Chat):
+        return types.PeerChat(entity.id)
+    return entity
+
+
+def parse_invite_hash(link: str) -> str:
+    marker = link.strip().rstrip("/").rsplit("/", 1)[-1]
+    return marker[1:] if marker.startswith("+") else marker
+
+
+async def ensure_folder_joined(session: Session, slug: str) -> bool:
+    """Best-effort: make a worker a member of every accessible source chat."""
+    client = session.client
+    try:
+        checked = cast(
+            Any,
+            await rpc_call(
+                f"{session.label}: check folder",
+                lambda: client(chatlists.CheckChatlistInviteRequest(slug=slug)),
+            ),
+        )
+        if isinstance(checked, chatlist_types.ChatlistInvite):
+            input_peers, _ = await resolve_input_peers(
+                client, checked.peers, checked.chats
+            )
+            if input_peers:
+                await rpc_call(
+                    f"{session.label}: join folder",
+                    lambda: client(
+                        chatlists.JoinChatlistInviteRequest(
+                            slug=slug, peers=input_peers
+                        )
+                    ),
+                )
+        elif isinstance(checked, chatlist_types.ChatlistInviteAlready):
+            if checked.missing_peers:
+                missing, _ = await resolve_input_peers(
+                    client, checked.missing_peers, checked.chats
+                )
+                if missing:
+                    await rpc_call(
+                        f"{session.label}: join folder updates",
+                        lambda: client(
+                            chatlists.JoinChatlistUpdatesRequest(
+                                chatlist=types.InputChatlistDialogFilter(
+                                    checked.filter_id
+                                ),
+                                peers=missing,
+                            )
+                        ),
+                    )
+        return True
+    except (RPCError, RuntimeError) as error:
+        console.print(
+            f"[yellow]{session.label} could not join the folder: "
+            f"{escape(str(error))}[/yellow]"
+        )
+        return False
+
+
+async def join_group(session: Session, invite_link: str, channel_id: int) -> Any | None:
+    """Make a worker a member of a destination group; return its input peer."""
+    client = session.client
+    invite_hash = parse_invite_hash(invite_link)
+    try:
+        await rpc_call(
+            f"{session.label}: join backup group",
+            lambda: client(messages.ImportChatInviteRequest(invite_hash)),
+            retry_server_errors=False,
+        )
+    except UserAlreadyParticipantError:
+        pass
+    except (
+        InviteHashExpiredError,
+        InviteHashInvalidError,
+        RPCError,
+        RuntimeError,
+    ) as error:
+        console.print(
+            f"[yellow]{session.label} could not join a backup group: "
+            f"{escape(str(error))}[/yellow]"
+        )
+        return None
+    try:
+        return await client.get_input_entity(types.PeerChannel(channel_id))
+    except (RPCError, ValueError, TypeError):
+        return None
 
 
 async def create_private_group(
@@ -760,6 +896,7 @@ async def copy_video(
     destination: Any,
     message: types.Message,
     temp_dir: Path,
+    progress_ui: bool = True,
 ) -> str:
     caption = video_caption(message.id)
 
@@ -795,15 +932,11 @@ async def copy_video(
     file_name = document_filename(document, message.id)
     media_path = temp_dir / f"{message.id}_{file_name}"
 
-    with transfer_progress() as progress:
-        task = progress.add_task(
-            f"Download · {escape(source_name)} · #{message.id}",
-            total=size or None,
-        )
-
-        def on_progress(current: int, total: int) -> None:
-            progress.update(task, completed=current, total=total or None)
-
+    async def transfer(
+        on_progress: Callable[[int, int], None],
+        set_upload_phase: Callable[[int], None],
+    ) -> None:
+        nonlocal media_path
         if size > 0:
             await rpc_call(
                 f"download video #{message.id}",
@@ -824,12 +957,7 @@ async def copy_video(
             media_path = Path(downloaded)
 
         actual_size = media_path.stat().st_size
-        progress.reset(
-            task,
-            description=f"Upload · #{message.id}",
-            total=actual_size or None,
-        )
-
+        set_upload_phase(actual_size)
         total_parts = math.ceil(actual_size / PART_SIZE) if actual_size else 0
         try:
             if 0 < actual_size and total_parts <= MAX_UPLOAD_PARTS:
@@ -867,7 +995,26 @@ async def copy_video(
                 )
         finally:
             media_path.unlink(missing_ok=True)
-        return "reuploaded"
+
+    if progress_ui:
+        with transfer_progress() as progress:
+            task = progress.add_task(
+                f"Download · {escape(source_name)} · #{message.id}",
+                total=size or None,
+            )
+
+            def on_progress(current: int, total: int) -> None:
+                progress.update(task, completed=current, total=total or None)
+
+            def set_upload_phase(total: int) -> None:
+                progress.reset(
+                    task, description=f"Upload · #{message.id}", total=total or None
+                )
+
+            await transfer(on_progress, set_upload_phase)
+    else:
+        await transfer(lambda current, total: None, lambda total: None)
+    return "reuploaded"
 
 
 async def destination_video_ids(client: TelegramClient, destination: Any) -> set[int]:
@@ -882,13 +1029,14 @@ async def destination_video_ids(client: TelegramClient, destination: Any) -> set
 
 
 async def backup_chat(
-    client: TelegramClient,
+    pool: list[Session],
     source: types.Chat | types.Channel,
     index: int,
     total: int,
     temp_dir: Path,
     state: StateStore,
 ) -> BackupResult:
+    client = pool[0].client
     source_title = utils.get_display_name(source) or f"Chat {utils.get_peer_id(source)}"
     source_key = str(utils.get_peer_id(source))
     target_title = backup_chat_title(source_title)
@@ -986,6 +1134,9 @@ async def backup_chat(
             f"checkpoint: {escape(str(error))}[/yellow]"
         )
 
+    # Scan the source once (via main) to collect the pending, in-limit videos.
+    pending: list[int] = []
+    seen: set[int] = set()
     filters = (
         types.InputMessagesFilterVideo(),
         types.InputMessagesFilterRoundVideo(),
@@ -997,8 +1148,9 @@ async def backup_chat(
                 reverse=True,
                 filter=media_filter,
             ):
-                if not message.video or message.id in copied_ids:
+                if not message.video or message.id in copied_ids or message.id in seen:
                     continue
+                seen.add(message.id)
                 size = video_size(message)
                 if size > MAX_VIDEO_BYTES:
                     result.skipped += 1
@@ -1007,27 +1159,37 @@ async def backup_chat(
                         f"skipped ({human_size(size)} > 100 MB)"
                     )
                     continue
-                try:
-                    mode = await copy_video(
-                        client, source, destination, message, temp_dir
-                    )
-                    copied_ids.add(message.id)
-                    record["copied_message_ids"] = sorted(copied_ids)
-                    state.save()
-                    result.copied += 1
-                    tag = "linked" if mode == "linked" else "re-uploaded"
-                    console.print(
-                        f"  [green]✓[/green] video [bold]#{message.id}[/bold] {tag}"
-                    )
-                except (OSError, RPCError, RuntimeError) as error:
-                    result.failed += 1
-                    console.print(
-                        f"  [red]✗[/red] video [bold]#{message.id}[/bold] failed: "
-                        f"{escape(str(error))}"
-                    )
+                pending.append(message.id)
         except RPCError as error:
             result.error = f"History scan failed: {error}"
             console.print(f"[red]{escape(result.error)}[/red]")
+
+    # Build the active worker set for this chat: main plus any worker that can
+    # both reach the source and post into this destination group.
+    active: list[tuple[Session, Any, Any]] = [(pool[0], source, destination)]
+    channel_id = int(record["destination_id"])
+    for worker in pool[1:]:
+        dest_peer = (
+            await join_group(worker, result.invite_link, channel_id)
+            if result.invite_link
+            else None
+        )
+        if dest_peer is None:
+            continue
+        try:
+            source_peer = await worker.client.get_input_entity(to_peer(source))
+        except (RPCError, ValueError, TypeError):
+            continue
+        active.append((worker, source_peer, dest_peer))
+
+    if pending:
+        if len(active) > 1:
+            console.print(
+                f"[dim]{len(pending)} video(s) across {len(active)} sessions[/dim]"
+            )
+        await copy_videos_pooled(
+            active, source, pending, temp_dir, copied_ids, record, state, result
+        )
 
     console.print(
         f"[bold]Finished:[/bold] {result.copied} new · "
@@ -1035,6 +1197,78 @@ async def backup_chat(
         f"{result.failed} failed"
     )
     return result
+
+
+async def copy_videos_pooled(
+    active: list[tuple[Session, Any, Any]],
+    source: types.Chat | types.Channel,
+    pending: list[int],
+    temp_dir: Path,
+    copied_ids: set[int],
+    record: dict[str, Any],
+    state: StateStore,
+    result: BackupResult,
+) -> None:
+    """Distribute the pending videos across every active session.
+
+    Each session pulls the next video id from a shared queue and copies it
+    end to end on its own connections, so N sessions give ~N times the
+    throughput. Live progress bars are only shown when a single session is
+    working (concurrent bars would collide), otherwise each line is tagged
+    with the session that copied it.
+    """
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for message_id in pending:
+        queue.put_nowait(message_id)
+
+    lock = asyncio.Lock()
+    progress_ui = len(active) == 1
+
+    async def consume(session: Session, source_peer: Any, dest_peer: Any) -> None:
+        while True:
+            try:
+                message_id = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                message = cast(
+                    Any,
+                    await rpc_call(
+                        f"{session.label}: fetch #{message_id}",
+                        lambda: session.client.get_messages(
+                            source_peer, ids=message_id
+                        ),
+                    ),
+                )
+                if message is None or not getattr(message, "video", None):
+                    continue
+                mode = await copy_video(
+                    session.client,
+                    source,
+                    dest_peer,
+                    message,
+                    temp_dir,
+                    progress_ui=progress_ui,
+                )
+                async with lock:
+                    copied_ids.add(message_id)
+                    record["copied_message_ids"] = sorted(copied_ids)
+                    state.save()
+                    result.copied += 1
+                tag = "linked" if mode == "linked" else "re-uploaded"
+                suffix = "" if progress_ui else f" [dim]· {session.label}[/dim]"
+                console.print(
+                    f"  [green]✓[/green] video [bold]#{message_id}[/bold] {tag}{suffix}"
+                )
+            except (OSError, RPCError, RuntimeError) as error:
+                async with lock:
+                    result.failed += 1
+                console.print(
+                    f"  [red]✗[/red] video [bold]#{message_id}[/bold] failed "
+                    f"({session.label}): {escape(str(error))}"
+                )
+
+    await asyncio.gather(*(consume(session, sp, dp) for (session, sp, dp) in active))
 
 
 async def free_filter_id(client: TelegramClient) -> int:
@@ -1157,22 +1391,49 @@ def show_summary(results: list[BackupResult], folder_title: str, link: str) -> b
     return complete
 
 
+async def disconnect_client(client: TelegramClient) -> None:
+    disconnect_result = cast(Any, client.disconnect())
+    if inspect.isawaitable(disconnect_result):
+        await disconnect_result
+
+
 async def run() -> bool:
     banner()
-    client: TelegramClient | None = None
+    pool: list[Session] = []
     try:
-        client = await authenticate()
+        client, api_id, api_hash = await authenticate()
+        pool.append(Session(client=client, label="main"))
+
+        worker_text = Prompt.ask(
+            "\n[bright_cyan]How many worker sessions to add (0-3)[/bright_cyan]",
+            default="0",
+        ).strip()
+        worker_count = min(3, int(worker_text)) if worker_text.isdigit() else 0
+        if worker_count:
+            pool.extend(await authenticate_workers(api_id, api_hash, worker_count))
+
         raw_link = Prompt.ask("\n[bright_cyan]Shared folder link[/bright_cyan]")
         slug = extract_folder_slug(raw_link)
         imported = await import_shared_folder(client, slug)
-        state = StateStore(slug)
 
+        # Workers must be members of the source chats to download from them.
+        active_pool: list[Session] = [pool[0]]
+        for worker in pool[1:]:
+            if await ensure_folder_joined(worker, slug):
+                active_pool.append(worker)
+        if len(active_pool) > 1:
+            console.print(
+                f"[green]{len(active_pool)} sessions ready[/green] "
+                f"([bold]{', '.join(s.label for s in active_pool)}[/bold])"
+            )
+
+        state = StateStore(slug)
         results: list[BackupResult] = []
         with tempfile.TemporaryDirectory(prefix="heartvault-") as temp:
             temp_dir = Path(temp)
             for index, source in enumerate(imported.chats, start=1):
                 result = await backup_chat(
-                    client,
+                    active_pool,
                     source,
                     index,
                     len(imported.chats),
@@ -1191,10 +1452,8 @@ async def run() -> bool:
         )
         return show_summary(results, folder_title, link)
     finally:
-        if client is not None:
-            disconnect_result = cast(Any, client.disconnect())
-            if inspect.isawaitable(disconnect_result):
-                await disconnect_result
+        for session in pool:
+            await disconnect_client(session.client)
 
 
 def main() -> None:
