@@ -48,6 +48,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
     TimedOutError,
     UserAlreadyParticipantError,
+    UserPrivacyRestrictedError,
 )
 from telethon.network import MTProtoSender
 from telethon.tl.alltlobjects import LAYER
@@ -128,6 +129,7 @@ class Session:
     client: TelegramClient
     label: str
     user_id: int
+    name: str = ""
 
 
 @dataclass(slots=True)
@@ -357,7 +359,7 @@ async def login_client(
     return client, me
 
 
-async def authenticate() -> tuple[TelegramClient, int, int, str]:
+async def authenticate() -> tuple[TelegramClient, Any, int, str]:
     console.print("\n[bold bright_magenta]Login[/bold bright_magenta]")
     api_id_text = Prompt.ask("[bright_cyan]API ID[/bright_cyan]").strip()
     if not api_id_text.isdigit():
@@ -371,7 +373,7 @@ async def authenticate() -> tuple[TelegramClient, int, int, str]:
         )
 
     client, me = await login_client(SESSION_FILE, api_id, api_hash, "Main")
-    return client, int(me.id), api_id, api_hash
+    return client, me, api_id, api_hash
 
 
 async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[Session]:
@@ -392,7 +394,14 @@ async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[S
                 f"[yellow]Worker {number} skipped ({escape(str(error))}).[/yellow]"
             )
             continue
-        workers.append(Session(client=client, label=f"w{number}", user_id=int(me.id)))
+        workers.append(
+            Session(
+                client=client,
+                label=f"w{number}",
+                user_id=int(me.id),
+                name=utils.get_display_name(me) or "",
+            )
+        )
     return workers
 
 
@@ -636,33 +645,140 @@ async def promote_workers(
             )
 
 
-async def join_group(session: Session, invite_link: str, channel_id: int) -> Any | None:
-    """Make a worker a member of a destination group; return its input peer."""
-    client = session.client
-    invite_hash = parse_invite_hash(invite_link)
+async def resolve_worker_user(
+    owner_client: TelegramClient, worker: Session, source: Any
+) -> Any | None:
+    """Resolve a worker to an InputUser the owner can act on.
+
+    First tries the owner's cache (populated once the owner and worker share
+    a group). Otherwise searches the shared source supergroup by the worker's
+    name, which caches the worker without any rate-limited join.
+    """
     try:
-        await rpc_call(
-            f"{session.label}: join backup group",
-            lambda: client(messages.ImportChatInviteRequest(invite_hash)),
-            retry_server_errors=False,
+        return cast(
+            Any,
+            utils.get_input_user(await owner_client.get_input_entity(worker.user_id)),
         )
-    except UserAlreadyParticipantError:
+    except (ValueError, RPCError, TypeError):
         pass
-    except (
-        InviteHashExpiredError,
-        InviteHashInvalidError,
-        RPCError,
-        RuntimeError,
-    ) as error:
-        console.print(
-            f"[yellow]{session.label} could not join a backup group: "
-            f"{escape(str(error))}[/yellow]"
-        )
-        return None
+    if isinstance(source, types.Channel) and worker.name:
+        try:
+            found = await owner_client.get_participants(
+                source, search=worker.name, limit=50
+            )
+        except (RPCError, ValueError, TypeError):
+            found = []
+        if any(getattr(user, "id", None) == worker.user_id for user in found):
+            try:
+                return cast(
+                    Any,
+                    utils.get_input_user(
+                        await owner_client.get_input_entity(worker.user_id)
+                    ),
+                )
+            except (ValueError, RPCError, TypeError):
+                return None
+    return None
+
+
+async def worker_channel_peer(
+    client: TelegramClient, channel_id: int, invite_link: str | None
+) -> Any | None:
+    """Resolve a worker's own input peer for a group it now belongs to."""
     try:
         return await client.get_input_entity(types.PeerChannel(channel_id))
     except (RPCError, ValueError, TypeError):
+        pass
+    if invite_link:
+        try:
+            checked = cast(
+                Any,
+                await client(
+                    messages.CheckChatInviteRequest(parse_invite_hash(invite_link))
+                ),
+            )
+            chat = getattr(checked, "chat", None)
+            if chat is not None:
+                return utils.get_input_peer(chat)
+        except (RPCError, ValueError, TypeError):
+            pass
+    return None
+
+
+async def worker_self_join(
+    session: Session, invite_link: str, channel_id: int
+) -> Any | None:
+    """Last resort: worker joins via invite link. Never waits out a FloodWait."""
+    client = session.client
+    try:
+        await client(messages.ImportChatInviteRequest(parse_invite_hash(invite_link)))
+    except UserAlreadyParticipantError:
+        pass
+    except FloodWaitError as error:
+        console.print(
+            f"[yellow]{session.label}: invite-link join is rate-limited "
+            f"({int(error.seconds)}s); skipping the join — the owner will add "
+            f"it to later groups instead.[/yellow]"
+        )
         return None
+    except (InviteHashExpiredError, InviteHashInvalidError, RPCError, RuntimeError):
+        return None
+    return await worker_channel_peer(client, channel_id, invite_link)
+
+
+async def attach_worker_to_group(
+    owner_client: TelegramClient,
+    worker: Session,
+    source: Any,
+    destination: Any,
+    channel_id: int,
+    invite_link: str | None,
+) -> Any | None:
+    """Get a worker into the destination group with minimal rate-limit risk.
+
+    Preferred path: the owner (group creator) adds the worker as a member,
+    which is not subject to the heavy invite-link join throttling. Only if the
+    owner cannot resolve/add the worker does it fall back to a self-join, and
+    that fallback never blocks on a long FloodWait.
+    """
+    channel: Any | None = None
+    try:
+        channel = cast(
+            Any,
+            utils.get_input_channel(await owner_client.get_input_entity(destination)),
+        )
+    except (RPCError, ValueError, TypeError):
+        channel = None
+
+    if channel is not None:
+        user = await resolve_worker_user(owner_client, worker, source)
+        if user is not None:
+            added = False
+            try:
+                await rpc_call(
+                    f"owner adds {worker.label}",
+                    lambda: owner_client(
+                        channels.InviteToChannelRequest(channel=channel, users=[user])
+                    ),
+                    retry_server_errors=False,
+                )
+                added = True
+            except UserAlreadyParticipantError:
+                added = True
+            except (UserPrivacyRestrictedError, RPCError, RuntimeError) as error:
+                console.print(
+                    f"[yellow]Owner could not add {worker.label} "
+                    f"({escape(str(error))}); trying self-join.[/yellow]"
+                )
+            if added:
+                peer = await worker_channel_peer(worker.client, channel_id, invite_link)
+                if peer is not None:
+                    console.print(f"[dim]{worker.label} added by owner[/dim]")
+                    return peer
+
+    if invite_link:
+        return await worker_self_join(worker, invite_link, channel_id)
+    return None
 
 
 async def create_private_group(
@@ -1233,11 +1349,10 @@ async def backup_chat(
     # both reach the source and post into this destination group.
     worker_entries: list[tuple[Session, Any, Any]] = []
     channel_id = int(record["destination_id"])
+    owner_client = pool[0].client
     for worker in pool[1:]:
-        dest_peer = (
-            await join_group(worker, result.invite_link, channel_id)
-            if result.invite_link
-            else None
+        dest_peer = await attach_worker_to_group(
+            owner_client, worker, source, destination, channel_id, result.invite_link
         )
         if dest_peer is None:
             continue
@@ -1482,8 +1597,15 @@ async def run() -> bool:
     banner()
     pool: list[Session] = []
     try:
-        client, main_user_id, api_id, api_hash = await authenticate()
-        pool.append(Session(client=client, label="main", user_id=main_user_id))
+        client, main_me, api_id, api_hash = await authenticate()
+        pool.append(
+            Session(
+                client=client,
+                label="main",
+                user_id=int(main_me.id),
+                name=utils.get_display_name(main_me) or "",
+            )
+        )
 
         worker_text = Prompt.ask(
             "\n[bright_cyan]How many worker sessions to add (0-3)[/bright_cyan]",
