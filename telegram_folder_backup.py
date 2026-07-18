@@ -127,6 +127,7 @@ class Session:
 
     client: TelegramClient
     label: str
+    user_id: int
 
 
 @dataclass(slots=True)
@@ -217,8 +218,8 @@ def small_caps(value: str) -> str:
 
 def backup_chat_title(source_title: str) -> str:
     styled = small_caps(source_title) or "ᴜɴᴛɪᴛʟᴇᴅ"
-    max_inner = 128 - len(TITLE_SUFFIX) - 2
-    return f"{{{styled[:max_inner].rstrip()}}}{TITLE_SUFFIX}"
+    max_inner = 128 - len(TITLE_SUFFIX)
+    return f"{styled[:max_inner].rstrip()}{TITLE_SUFFIX}"
 
 
 def backup_folder_title(source_title: str) -> str:
@@ -334,7 +335,7 @@ async def finish_otp_login(client: TelegramClient, phone: str) -> None:
 
 async def login_client(
     session_name: str, api_id: int, api_hash: str, role: str
-) -> TelegramClient:
+) -> tuple[TelegramClient, Any]:
     session_path = Path(__file__).resolve().parent / session_name
     client = TelegramClient(str(session_path), api_id, api_hash)
     await client.connect()
@@ -353,10 +354,10 @@ async def login_client(
     console.print(
         f"[green]{role} connected as[/green] [bold]{escape(display_name)}[/bold]"
     )
-    return client
+    return client, me
 
 
-async def authenticate() -> tuple[TelegramClient, int, str]:
+async def authenticate() -> tuple[TelegramClient, int, int, str]:
     console.print("\n[bold bright_magenta]Login[/bold bright_magenta]")
     api_id_text = Prompt.ask("[bright_cyan]API ID[/bright_cyan]").strip()
     if not api_id_text.isdigit():
@@ -369,8 +370,8 @@ async def authenticate() -> tuple[TelegramClient, int, str]:
             "API Hash must be the 32-character value from my.telegram.org."
         )
 
-    client = await login_client(SESSION_FILE, api_id, api_hash, "Main")
-    return client, api_id, api_hash
+    client, me = await login_client(SESSION_FILE, api_id, api_hash, "Main")
+    return client, int(me.id), api_id, api_hash
 
 
 async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[Session]:
@@ -383,7 +384,7 @@ async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[S
             f"\n[bold bright_magenta]Worker {number} login[/bold bright_magenta]"
         )
         try:
-            client = await login_client(
+            client, me = await login_client(
                 f"{SESSION_FILE}_worker{number}", api_id, api_hash, f"Worker {number}"
             )
         except (RPCError, RuntimeError, ValueError) as error:
@@ -391,7 +392,7 @@ async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[S
                 f"[yellow]Worker {number} skipped ({escape(str(error))}).[/yellow]"
             )
             continue
-        workers.append(Session(client=client, label=f"w{number}"))
+        workers.append(Session(client=client, label=f"w{number}", user_id=int(me.id)))
     return workers
 
 
@@ -569,6 +570,70 @@ async def ensure_folder_joined(session: Session, slug: str) -> bool:
             f"{escape(str(error))}[/yellow]"
         )
         return False
+
+
+async def promote_workers(
+    main_client: TelegramClient, destination: Any, workers: list[Session]
+) -> None:
+    """Promote every joined worker to admin in the destination group so they
+    can post reliably and manage the backup alongside the main account."""
+    if not workers:
+        return
+    try:
+        channel = cast(
+            Any,
+            utils.get_input_channel(await main_client.get_input_entity(destination)),
+        )
+    except (RPCError, ValueError, TypeError):
+        return
+    # Fetch participants so the main account caches each worker's access hash.
+    try:
+        await main_client.get_participants(destination, limit=200)
+    except (RPCError, ValueError):
+        pass
+
+    rights = types.ChatAdminRights(
+        change_info=True,
+        post_messages=True,
+        edit_messages=True,
+        delete_messages=True,
+        ban_users=True,
+        invite_users=True,
+        pin_messages=True,
+        manage_call=True,
+    )
+    for worker in workers:
+        try:
+            user = cast(
+                Any,
+                utils.get_input_user(
+                    await main_client.get_input_entity(worker.user_id)
+                ),
+            )
+        except (RPCError, ValueError, TypeError):
+            console.print(
+                f"[yellow]Could not resolve {worker.label} to promote[/yellow]"
+            )
+            continue
+        try:
+            await rpc_call(
+                f"promote {worker.label}",
+                lambda user=user: main_client(
+                    channels.EditAdminRequest(
+                        channel=channel,
+                        user_id=user,
+                        admin_rights=rights,
+                        rank="worker",
+                    )
+                ),
+                retry_server_errors=False,
+            )
+            console.print(f"[green]{worker.label} promoted to admin[/green]")
+        except (RPCError, RuntimeError) as error:
+            console.print(
+                f"[yellow]Could not promote {worker.label}: "
+                f"{escape(str(error))}[/yellow]"
+            )
 
 
 async def join_group(session: Session, invite_link: str, channel_id: int) -> Any | None:
@@ -1182,6 +1247,10 @@ async def backup_chat(
             continue
         active.append((worker, source_peer, dest_peer))
 
+    joined_workers = [session for (session, _sp, _dp) in active[1:]]
+    if joined_workers:
+        await promote_workers(pool[0].client, destination, joined_workers)
+
     if pending:
         if len(active) > 1:
             console.print(
@@ -1401,8 +1470,8 @@ async def run() -> bool:
     banner()
     pool: list[Session] = []
     try:
-        client, api_id, api_hash = await authenticate()
-        pool.append(Session(client=client, label="main"))
+        client, main_user_id, api_id, api_hash = await authenticate()
+        pool.append(Session(client=client, label="main", user_id=main_user_id))
 
         worker_text = Prompt.ask(
             "\n[bright_cyan]How many worker sessions to add (0-3)[/bright_cyan]",
