@@ -1,0 +1,13 @@
+# Telegram authorization sessions (keep private)
+*.session
+*.session-journal
+.heartvault_state.json
+.heartvault_state.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local temporary media
+heartvault-*/
