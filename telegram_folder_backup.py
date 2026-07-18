@@ -44,6 +44,7 @@ from telethon.errors import (
     RPCError,
     ServerError,
     SessionPasswordNeededError,
+    TimedOutError,
 )
 from telethon.network import MTProtoSender
 from telethon.tl.alltlobjects import LAYER
@@ -68,6 +69,18 @@ MAX_UPLOAD_PARTS = 4000
 # the file, so throughput scales roughly linearly with this until bandwidth or
 # Telegram throttling is the limit.
 MAX_TRANSFER_CONNECTIONS = 8
+# A single file part is retried this many times before the video is failed.
+# Telegram frequently times out or briefly drops individual part requests on
+# large transfers, and one slow part must not abort the whole file.
+PART_RETRIES = 6
+# Transient errors worth retrying at the part level (timeouts, server hiccups,
+# and dropped connections). Builtin TimeoutError is asyncio's timeout in 3.11+.
+TRANSIENT_TRANSFER_ERRORS = (
+    TimedOutError,
+    ServerError,
+    ConnectionError,
+    TimeoutError,
+)
 HEART = "💗"
 TITLE_SUFFIX = f" ~ {HEART}"
 SMALL_CAPS = str.maketrans(
@@ -618,6 +631,34 @@ def document_filename(document: Any, message_id: int) -> str:
     return f"video_{message_id}.mp4"
 
 
+async def call_part(
+    client: TelegramClient, sender: Any, request: Any, label: str
+) -> Any:
+    """Invoke one file-part request, retrying transient timeouts and drops.
+
+    The MTProto sender auto-reconnects, so re-issuing the same part request
+    after a timeout succeeds without restarting the whole file.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await client._call(sender, request)
+        except FloodWaitError as error:
+            wait_for = max(1, int(error.seconds)) + 1
+            if wait_for > MAX_FLOOD_WAIT:
+                raise
+            await asyncio.sleep(wait_for)
+        except TRANSIENT_TRANSFER_ERRORS:
+            attempt += 1
+            if attempt >= PART_RETRIES:
+                raise
+            delay = min(2**attempt, 15)
+            console.log(
+                f"[dim]{escape(label)}: transient error, retry in {delay}s[/dim]"
+            )
+            await asyncio.sleep(delay)
+
+
 async def parallel_download(
     client: TelegramClient,
     document: Any,
@@ -640,8 +681,11 @@ async def parallel_download(
         part = start
         while part < total_parts:
             offset = part * PART_SIZE
-            result = await client._call(
-                sender, GetFileRequest(location, offset=offset, limit=PART_SIZE)
+            result = await call_part(
+                client,
+                sender,
+                GetFileRequest(location, offset=offset, limit=PART_SIZE),
+                f"download part {part}",
             )
             chunk = getattr(result, "bytes", b"")
             if chunk:
@@ -684,7 +728,8 @@ async def parallel_upload(
         while part < total_parts:
             offset = part * PART_SIZE
             chunk = os.pread(file_descriptor, PART_SIZE, offset)
-            await client._call(
+            await call_part(
+                client,
                 sender,
                 SaveBigFilePartRequest(
                     file_id=file_id,
@@ -692,6 +737,7 @@ async def parallel_upload(
                     file_total_parts=total_parts,
                     bytes=chunk,
                 ),
+                f"upload part {part}",
             )
             async with lock:
                 done += len(chunk)
