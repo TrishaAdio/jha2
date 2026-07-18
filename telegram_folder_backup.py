@@ -1231,7 +1231,7 @@ async def backup_chat(
 
     # Build the active worker set for this chat: main plus any worker that can
     # both reach the source and post into this destination group.
-    active: list[tuple[Session, Any, Any]] = [(pool[0], source, destination)]
+    worker_entries: list[tuple[Session, Any, Any]] = []
     channel_id = int(record["destination_id"])
     for worker in pool[1:]:
         dest_peer = (
@@ -1245,19 +1245,31 @@ async def backup_chat(
             source_peer = await worker.client.get_input_entity(to_peer(source))
         except (RPCError, ValueError, TypeError):
             continue
-        active.append((worker, source_peer, dest_peer))
+        worker_entries.append((worker, source_peer, dest_peer))
 
-    joined_workers = [session for (session, _sp, _dp) in active[1:]]
-    if joined_workers:
-        await promote_workers(pool[0].client, destination, joined_workers)
+    if worker_entries:
+        await promote_workers(
+            pool[0].client, destination, [s for (s, _sp, _dp) in worker_entries]
+        )
+
+    # The owner only creates the group, invites and promotes the workers. To
+    # keep the owner account clean, the actual posting is done exclusively by
+    # the workers; the owner posts only as a fallback when no worker is usable.
+    if worker_entries:
+        copy_pool = worker_entries
+    else:
+        if pool[1:]:
+            console.print(
+                "[yellow]No worker could post here; the owner will post as "
+                "a fallback.[/yellow]"
+            )
+        copy_pool = [(pool[0], source, destination)]
 
     if pending:
-        if len(active) > 1:
-            console.print(
-                f"[dim]{len(pending)} video(s) across {len(active)} sessions[/dim]"
-            )
+        posters = ", ".join(session.label for (session, _sp, _dp) in copy_pool)
+        console.print(f"[dim]{len(pending)} video(s) · posting via {posters}[/dim]")
         await copy_videos_pooled(
-            active, source, pending, temp_dir, copied_ids, record, state, result
+            copy_pool, source, pending, temp_dir, copied_ids, record, state, result
         )
 
     console.print(
