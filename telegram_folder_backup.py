@@ -929,55 +929,64 @@ async def worker_self_join(
     return await worker_channel_peer(client, channel_id, invite_link)
 
 
+async def invite_worker_via(
+    inviter: Session, target: Session, source: Any, channel_id: int
+) -> str:
+    """Have one member (owner or an admin worker) add ``target`` to the group.
+
+    Returns: "ok" if added/already in, "privacy" if the target blocks being
+    added by anyone (self-join needed), or "busy" if this inviter can't do it
+    right now (rate-limited or can't resolve) so another inviter should try.
+    """
+    client = inviter.client
+    try:
+        channel = cast(
+            Any,
+            utils.get_input_channel(
+                await client.get_input_entity(types.PeerChannel(channel_id))
+            ),
+        )
+    except (RPCError, ValueError, TypeError):
+        return "busy"
+    user = await resolve_worker_user(client, target, source)
+    if user is None:
+        return "busy"
+    try:
+        await client(channels.InviteToChannelRequest(channel=channel, users=[user]))
+        return "ok"
+    except UserAlreadyParticipantError:
+        return "ok"
+    except UserPrivacyRestrictedError:
+        return "privacy"
+    except (FloodWaitError, RPCError, RuntimeError):
+        return "busy"
+
+
 async def attach_worker_to_group(
-    owner_client: TelegramClient,
+    inviters: list[Session],
     worker: Session,
     source: Any,
-    destination: Any,
     channel_id: int,
     invite_link: str | None,
 ) -> Any | None:
     """Get a worker into the destination group with minimal rate-limit risk.
 
-    Preferred path: the owner (group creator) adds the worker as a member,
-    which is not subject to the heavy invite-link join throttling. Only if the
-    owner cannot resolve/add the worker does it fall back to a self-join, and
-    that fallback never blocks on a long FloodWait.
+    Tries the owner first, then any already-joined admin worker (they each
+    have invite rights), so if one account is rate-limited on
+    InviteToChannel the next one adds the worker. Only when no member can add
+    it does the worker fall back to a self-join (which never blocks on a long
+    FloodWait).
     """
-    channel: Any | None = None
-    try:
-        channel = cast(
-            Any,
-            utils.get_input_channel(await owner_client.get_input_entity(destination)),
-        )
-    except (RPCError, ValueError, TypeError):
-        channel = None
-
-    if channel is not None:
-        user = await resolve_worker_user(owner_client, worker, source)
-        if user is not None:
-            added = False
-            try:
-                await rpc_call(
-                    f"owner adds {worker.label}",
-                    lambda: owner_client(
-                        channels.InviteToChannelRequest(channel=channel, users=[user])
-                    ),
-                    retry_server_errors=False,
-                )
-                added = True
-            except UserAlreadyParticipantError:
-                added = True
-            except (UserPrivacyRestrictedError, RPCError, RuntimeError) as error:
-                console.print(
-                    f"[yellow]Owner could not add {worker.label} "
-                    f"({escape(str(error))}); trying self-join.[/yellow]"
-                )
-            if added:
-                peer = await worker_channel_peer(worker.client, channel_id, invite_link)
-                if peer is not None:
-                    console.print(f"[dim]{worker.label} added by owner[/dim]")
-                    return peer
+    for inviter in inviters:
+        outcome = await invite_worker_via(inviter, worker, source, channel_id)
+        if outcome == "ok":
+            peer = await worker_channel_peer(worker.client, channel_id, invite_link)
+            if peer is not None:
+                console.print(f"[dim]{worker.label} added by {inviter.label}[/dim]")
+                return peer
+        elif outcome == "privacy":
+            # No member can add this account; only a self-join will work.
+            break
 
     if invite_link:
         return await worker_self_join(worker, invite_link, channel_id)
@@ -1576,10 +1585,12 @@ async def backup_chat(
     # both reach the source and post into this destination group.
     worker_entries: list[tuple[Session, Any, Any]] = []
     channel_id = int(record["destination_id"])
-    owner_client = pool[0].client
+    owner = pool[0]
+    # The owner plus every worker already in the group can add the next worker.
+    inviters: list[Session] = [owner]
     for worker in pool[1:]:
         dest_peer = await attach_worker_to_group(
-            owner_client, worker, source, destination, channel_id, result.invite_link
+            inviters, worker, source, channel_id, result.invite_link
         )
         if dest_peer is None:
             continue
@@ -1588,11 +1599,9 @@ async def backup_chat(
         except (RPCError, ValueError, TypeError):
             continue
         worker_entries.append((worker, source_peer, dest_peer))
-
-    if worker_entries:
-        await promote_workers(
-            pool[0].client, destination, [s for (s, _sp, _dp) in worker_entries]
-        )
+        # Promote right away so this worker can post and also help add the rest.
+        await promote_workers(owner.client, destination, [worker])
+        inviters.append(worker)
 
     # Report any worker that could not join this group, so it is clear why a
     # session is not posting here (rather than silently using fewer workers).
