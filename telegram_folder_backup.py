@@ -452,11 +452,16 @@ async def authenticate() -> tuple[TelegramClient, Any, int, str]:
     return client, me, api_id, api_hash
 
 
-async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[Session]:
+async def authenticate_workers(
+    api_id: int, api_hash: str, count: int, existing_ids: set[int]
+) -> list[Session]:
     """Log in extra accounts that share the workload. They reuse the main
     application's API credentials; each just needs its own phone/OTP once,
-    after which the session persists to disk."""
+    after which the session persists to disk. Accounts already used (as the
+    owner or another worker) are skipped so duplicates do not silently reduce
+    the number of distinct workers."""
     workers: list[Session] = []
+    seen = set(existing_ids)
     for number in range(1, count + 1):
         console.print(
             f"\n[bold bright_magenta]Worker {number} login[/bold bright_magenta]"
@@ -470,6 +475,14 @@ async def authenticate_workers(api_id: int, api_hash: str, count: int) -> list[S
                 f"[yellow]Worker {number} skipped ({escape(str(error))}).[/yellow]"
             )
             continue
+        if int(me.id) in seen:
+            console.print(
+                f"[yellow]Worker {number} is the same account as another "
+                f"session; skipping the duplicate.[/yellow]"
+            )
+            await disconnect_client(client)
+            continue
+        seen.add(int(me.id))
         workers.append(
             Session(
                 client=client,
@@ -1581,6 +1594,16 @@ async def backup_chat(
             pool[0].client, destination, [s for (s, _sp, _dp) in worker_entries]
         )
 
+    # Report any worker that could not join this group, so it is clear why a
+    # session is not posting here (rather than silently using fewer workers).
+    attached_labels = {s.label for (s, _sp, _dp) in worker_entries}
+    missing = [w.label for w in pool[1:] if w.label not in attached_labels]
+    if missing:
+        console.print(
+            f"[yellow]Not posting here via: {', '.join(missing)} "
+            f"(could not join this group this time)[/yellow]"
+        )
+
     # The owner only creates the group, invites and promotes the workers. To
     # keep the owner account clean, the actual posting is done exclusively by
     # the workers; the owner posts only as a fallback when no worker is usable.
@@ -1588,6 +1611,15 @@ async def backup_chat(
     ready_workers = [
         entry for entry in worker_entries if entry[0].cooldown_until <= now
     ]
+    cooling = [
+        f"{s.label} (~{int(s.cooldown_until - now)}s)"
+        for (s, _sp, _dp) in worker_entries
+        if s.cooldown_until > now
+    ]
+    if cooling:
+        console.print(
+            f"[yellow]Cooling down (throttled): {', '.join(cooling)}[/yellow]"
+        )
     if ready_workers:
         copy_pool = ready_workers
     elif worker_entries:
@@ -1888,7 +1920,13 @@ async def run() -> bool:
             min(MAX_WORKERS, int(worker_text)) if worker_text.isdigit() else 0
         )
         if worker_count:
-            pool.extend(await authenticate_workers(api_id, api_hash, worker_count))
+            existing_ids = {s.user_id for s in pool}
+            pool.extend(
+                await authenticate_workers(api_id, api_hash, worker_count, existing_ids)
+            )
+            console.print(
+                f"\n[green]{len(pool) - 1} distinct worker account(s) ready[/green]"
+            )
 
         raw_links = Prompt.ask(
             "\n[bright_cyan]Shared folder link(s) — separate several with a "
