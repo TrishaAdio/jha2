@@ -541,6 +541,82 @@ async def join_channels_individually(
             pass
 
 
+async def chatlist_filter_ids(client: TelegramClient) -> set[int]:
+    filters = cast(
+        Any,
+        await rpc_call(
+            "load Telegram folders",
+            lambda: client(messages.GetDialogFiltersRequest()),
+        ),
+    )
+    return {
+        int(item.id)
+        for item in filters.filters
+        if isinstance(item, types.DialogFilterChatlist)
+    }
+
+
+async def release_chatlist_slot(
+    client: TelegramClient, filter_id: int, label: str
+) -> None:
+    """Remove a shared-folder view while keeping every channel in it.
+
+    ``leaveChatlist`` with an empty ``peers`` list deletes only the folder;
+    all channels/groups stay joined, so this never loses access to chats.
+    """
+    try:
+        await rpc_call(
+            f"{label}: release folder slot",
+            lambda: client(
+                chatlists.LeaveChatlistRequest(
+                    chatlist=types.InputChatlistDialogFilter(filter_id), peers=[]
+                )
+            ),
+            retry_server_errors=False,
+        )
+    except (RPCError, RuntimeError):
+        pass
+
+
+async def join_chatlist_transient(
+    client: TelegramClient, slug: str, input_peers: list[Any], label: str
+) -> None:
+    """Join a shared folder's channels without permanently keeping the folder.
+
+    Steps: import the folder (joins the channels, including private ones),
+    then release the folder slot but keep the channels. If the account is at
+    the shared-folder limit, free one slot from an existing shared folder
+    (its channels are kept) and retry. The tool therefore never accumulates
+    folder slots across runs.
+    """
+    baseline = await chatlist_filter_ids(client)
+
+    def do_join() -> Any:
+        return client(chatlists.JoinChatlistInviteRequest(slug=slug, peers=input_peers))
+
+    try:
+        await rpc_call(f"{label}: join folder", do_join, retry_server_errors=False)
+    except RPCError as error:
+        if not is_chatlists_full(error) or not baseline:
+            raise
+        victim = max(baseline)
+        console.print(
+            f"[yellow]{label}: folder limit reached; releasing one shared-folder "
+            f"view to make room (all its channels stay joined).[/yellow]"
+        )
+        await release_chatlist_slot(client, victim, label)
+        baseline.discard(victim)
+        await rpc_call(
+            f"{label}: join folder (retry)", do_join, retry_server_errors=False
+        )
+
+    # Release our freshly imported folder too, keeping the channels, so the
+    # slot is not held after this run.
+    after = await chatlist_filter_ids(client)
+    for new_id in sorted(after - baseline):
+        await release_chatlist_slot(client, new_id, label)
+
+
 async def import_shared_folder(client: TelegramClient, slug: str) -> ImportedFolder:
     console.print(
         "\n[bold bright_magenta]Importing shared folder[/bold bright_magenta]"
@@ -561,19 +637,13 @@ async def import_shared_folder(client: TelegramClient, slug: str) -> ImportedFol
         if not input_peers:
             raise RuntimeError("The folder contains no accessible channels or groups.")
         try:
-            await rpc_call(
-                "join shared folder",
-                lambda: client(
-                    chatlists.JoinChatlistInviteRequest(slug=slug, peers=input_peers)
-                ),
-                retry_server_errors=False,
-            )
+            await join_chatlist_transient(client, slug, input_peers, "Main")
         except RPCError as error:
             if not is_chatlists_full(error):
                 raise
             console.print(
-                "[yellow]Folder limit reached; joining the channels directly "
-                "instead (no new folder is created).[/yellow]"
+                "[yellow]Could not free a folder slot; joining public channels "
+                "only (private ones may be unreachable this run).[/yellow]"
             )
             await join_channels_individually(client, entities, "Main")
     elif isinstance(checked, chatlist_types.ChatlistInviteAlready):
@@ -647,14 +717,8 @@ async def ensure_folder_joined(session: Session, slug: str) -> bool:
             )
             if input_peers:
                 try:
-                    await rpc_call(
-                        f"{session.label}: join folder",
-                        lambda: client(
-                            chatlists.JoinChatlistInviteRequest(
-                                slug=slug, peers=input_peers
-                            )
-                        ),
-                        retry_server_errors=False,
+                    await join_chatlist_transient(
+                        client, slug, input_peers, session.label
                     )
                 except RPCError as error:
                     if not is_chatlists_full(error):
