@@ -507,6 +507,40 @@ async def imported_filter_title(client: TelegramClient, filter_id: int) -> str:
     return "Backup"
 
 
+def is_chatlists_full(error: Exception) -> bool:
+    return "CHATLISTS_TOO_MUCH" in str(error)
+
+
+async def join_channels_individually(
+    client: TelegramClient, entities: Sequence[Any], label: str
+) -> None:
+    """Join each source channel directly, creating no folder.
+
+    Used when the account already has the maximum number of Telegram folders
+    (CHATLISTS_TOO_MUCH): we still need channel membership to download, but we
+    do not need the folder itself.
+    """
+    for entity in entities:
+        if not isinstance(entity, types.Channel):
+            continue
+        name = utils.get_display_name(entity) or "channel"
+        try:
+            await client(
+                channels.JoinChannelRequest(cast(Any, utils.get_input_channel(entity)))
+            )
+        except UserAlreadyParticipantError:
+            pass
+        except FloodWaitError as error:
+            console.print(
+                f"[yellow]{label}: joining '{escape(name)}' is rate-limited "
+                f"({int(error.seconds)}s); public channels still read without "
+                f"joining.[/yellow]"
+            )
+        except (RPCError, RuntimeError):
+            # Public channels can be read without joining, so keep going.
+            pass
+
+
 async def import_shared_folder(client: TelegramClient, slug: str) -> ImportedFolder:
     console.print(
         "\n[bold bright_magenta]Importing shared folder[/bold bright_magenta]"
@@ -526,12 +560,22 @@ async def import_shared_folder(client: TelegramClient, slug: str) -> ImportedFol
         )
         if not input_peers:
             raise RuntimeError("The folder contains no accessible channels or groups.")
-        await rpc_call(
-            "join shared folder",
-            lambda: client(
-                chatlists.JoinChatlistInviteRequest(slug=slug, peers=input_peers)
-            ),
-        )
+        try:
+            await rpc_call(
+                "join shared folder",
+                lambda: client(
+                    chatlists.JoinChatlistInviteRequest(slug=slug, peers=input_peers)
+                ),
+                retry_server_errors=False,
+            )
+        except RPCError as error:
+            if not is_chatlists_full(error):
+                raise
+            console.print(
+                "[yellow]Folder limit reached; joining the channels directly "
+                "instead (no new folder is created).[/yellow]"
+            )
+            await join_channels_individually(client, entities, "Main")
     elif isinstance(checked, chatlist_types.ChatlistInviteAlready):
         title = await imported_filter_title(client, checked.filter_id)
         all_refs = [*checked.already_peers, *checked.missing_peers]
@@ -598,18 +642,24 @@ async def ensure_folder_joined(session: Session, slug: str) -> bool:
             ),
         )
         if isinstance(checked, chatlist_types.ChatlistInvite):
-            input_peers, _ = await resolve_input_peers(
+            input_peers, entities = await resolve_input_peers(
                 client, checked.peers, checked.chats
             )
             if input_peers:
-                await rpc_call(
-                    f"{session.label}: join folder",
-                    lambda: client(
-                        chatlists.JoinChatlistInviteRequest(
-                            slug=slug, peers=input_peers
-                        )
-                    ),
-                )
+                try:
+                    await rpc_call(
+                        f"{session.label}: join folder",
+                        lambda: client(
+                            chatlists.JoinChatlistInviteRequest(
+                                slug=slug, peers=input_peers
+                            )
+                        ),
+                        retry_server_errors=False,
+                    )
+                except RPCError as error:
+                    if not is_chatlists_full(error):
+                        raise
+                    await join_channels_individually(client, entities, session.label)
         elif isinstance(checked, chatlist_types.ChatlistInviteAlready):
             if checked.missing_peers:
                 missing, _ = await resolve_input_peers(
