@@ -151,9 +151,16 @@ class BackupResult:
 
 
 class StateStore:
-    """Durable per-folder checkpoints for safe resume after interruption."""
+    """Durable, brand-keyed checkpoints shared across every folder and run.
 
-    def __init__(self, slug: str) -> None:
+    Backup groups are keyed by a "brand" derived from the source name (see
+    ``brand_key``) so that sibling channels such as "Chochlate qt" and
+    "Chochlate haha" reuse a single group. Copied message ids are tracked per
+    source inside each group to keep de-duplication correct even when several
+    channels share one destination.
+    """
+
+    def __init__(self) -> None:
         self.path = Path(__file__).resolve().parent / STATE_FILE
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -163,9 +170,40 @@ class StateStore:
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Could not read backup state: {error}") from error
 
-        folders = self.data.setdefault("folders", {})
-        self.folder = folders.setdefault(slug, {"groups": {}})
-        self.groups: dict[str, dict[str, Any]] = self.folder.setdefault("groups", {})
+        self.groups: dict[str, dict[str, Any]] = self.data.setdefault("groups", {})
+        self._migrate_legacy()
+
+    def _migrate_legacy(self) -> None:
+        """Fold the old per-folder, per-peer layout into brand-keyed groups."""
+        folders = self.data.get("folders")
+        if not isinstance(folders, dict):
+            return
+        for folder in folders.values():
+            old_groups = folder.get("groups", {}) if isinstance(folder, dict) else {}
+            for source_key, record in old_groups.items():
+                if not isinstance(record, dict) or "destination_id" not in record:
+                    continue
+                title = record.get("source_title") or ""
+                brand = brand_key(title)
+                group = self.groups.get(brand)
+                if group is None:
+                    group = {
+                        "backup_title": record.get("backup_title"),
+                        "destination_id": record.get("destination_id"),
+                        "access_hash": record.get("access_hash"),
+                        "invite_link": record.get("invite_link"),
+                        "sources": {},
+                    }
+                    self.groups[brand] = group
+                group["sources"].setdefault(
+                    source_key,
+                    {
+                        "title": title,
+                        "copied_message_ids": record.get("copied_message_ids", []),
+                    },
+                )
+        self.data.pop("folders", None)
+        self.save()
 
     def save(self) -> None:
         temporary = self.path.with_suffix(".tmp")
@@ -222,6 +260,23 @@ def backup_chat_title(source_title: str) -> str:
     styled = small_caps(source_title) or "ᴜɴᴛɪᴛʟᴇᴅ"
     max_inner = 128 - len(TITLE_SUFFIX)
     return f"{styled[:max_inner].rstrip()}{TITLE_SUFFIX}"
+
+
+def brand_key(source_title: str) -> str:
+    """Group sibling channels under a shared key from the first name word.
+
+    Decorations and case are normalized first, so "Chochlate qt",
+    "𝗖𝗵𝗼𝗰𝗵𝗹𝗮𝘁𝗲 haha" and "chochlate 18+" all map to "chochlate" and reuse a
+    single backup group. Names with no usable word fall back to the whole
+    normalized string.
+    """
+    base = canonical_source_name(source_title).lower().strip()
+    if not base:
+        return "backup"
+    tokens = base.split()
+    first = tokens[0]
+    trimmed = re.sub(r"^[\W_]+|[\W_]+$", "", first, flags=re.UNICODE)
+    return trimmed or first
 
 
 def backup_folder_title(source_title: str) -> str:
@@ -1226,13 +1281,16 @@ async def backup_chat(
     client = pool[0].client
     source_title = utils.get_display_name(source) or f"Chat {utils.get_peer_id(source)}"
     source_key = str(utils.get_peer_id(source))
+    brand = brand_key(source_title)
     target_title = backup_chat_title(source_title)
     console.rule(
         f"[bold bright_magenta]{index}/{total}[/bold bright_magenta] "
         f"[bold]{escape(source_title)}[/bold]"
     )
 
-    record = state.groups.get(source_key)
+    # Reuse an existing group for the same brand (e.g. "chochlate qt" reuses
+    # the group made for "chochlate haha"); otherwise create a new one.
+    record = state.groups.get(brand)
     destination: Any | None = None
     if record:
         try:
@@ -1246,12 +1304,18 @@ async def backup_chat(
                 "verify saved backup group",
                 lambda: client.get_entity(saved_destination),
             )
-            console.print("[bright_cyan]Resuming saved private group[/bright_cyan]")
+            if source_key in record.get("sources", {}):
+                console.print("[bright_cyan]Resuming saved private group[/bright_cyan]")
+            else:
+                console.print(
+                    f"[bright_cyan]Matched existing group[/bright_cyan] "
+                    f"[bold]{escape(target_title)}[/bold] — backing up into it"
+                )
         except (KeyError, TypeError, ValueError, RPCError):
             console.print(
                 "[yellow]Saved private group is unavailable; creating a new one.[/yellow]"
             )
-            state.groups.pop(source_key, None)
+            state.groups.pop(brand, None)
             state.save()
             record = None
             destination = None
@@ -1263,14 +1327,13 @@ async def backup_chat(
                 raise RuntimeError("The new private group has no access hash.")
             destination = created
             record = {
-                "source_title": source_title,
                 "backup_title": target_title,
                 "destination_id": created.id,
                 "access_hash": created.access_hash,
                 "invite_link": None,
-                "copied_message_ids": [],
+                "sources": {},
             }
-            state.groups[source_key] = record
+            state.groups[brand] = record
             state.save()
         except (RPCError, RuntimeError) as error:
             console.print(
@@ -1285,6 +1348,12 @@ async def backup_chat(
 
     if record is None:
         raise RuntimeError("Backup state was not initialized for the destination.")
+
+    sources = record.setdefault("sources", {})
+    source_record = sources.setdefault(
+        source_key, {"title": source_title, "copied_message_ids": []}
+    )
+    state.save()
 
     result = BackupResult(
         source_title=source_title,
@@ -1307,19 +1376,22 @@ async def backup_chat(
         print_named_link(target_title, result.invite_link)
 
     copied_ids = {
-        int(message_id) for message_id in record.get("copied_message_ids", [])
+        int(message_id) for message_id in source_record.get("copied_message_ids", [])
     }
-    try:
-        remote_ids = await destination_video_ids(client, destination)
-        if not remote_ids.issubset(copied_ids):
-            copied_ids.update(remote_ids)
-            record["copied_message_ids"] = sorted(copied_ids)
-            state.save()
-    except RPCError as error:
-        console.print(
-            f"[yellow]Could not reconcile remote captions; using the saved "
-            f"checkpoint: {escape(str(error))}[/yellow]"
-        )
+    # Caption-based recovery only makes sense when this group holds a single
+    # source; merged groups mix message ids from different channels.
+    if len(sources) == 1:
+        try:
+            remote_ids = await destination_video_ids(client, destination)
+            if not remote_ids.issubset(copied_ids):
+                copied_ids.update(remote_ids)
+                source_record["copied_message_ids"] = sorted(copied_ids)
+                state.save()
+        except RPCError as error:
+            console.print(
+                f"[yellow]Could not reconcile remote captions; using the saved "
+                f"checkpoint: {escape(str(error))}[/yellow]"
+            )
 
     # Scan the source once (via main) to collect the pending, in-limit videos.
     pending: list[int] = []
@@ -1390,7 +1462,14 @@ async def backup_chat(
         posters = ", ".join(session.label for (session, _sp, _dp) in copy_pool)
         console.print(f"[dim]{len(pending)} video(s) · posting via {posters}[/dim]")
         await copy_videos_pooled(
-            copy_pool, source, pending, temp_dir, copied_ids, record, state, result
+            copy_pool,
+            source,
+            pending,
+            temp_dir,
+            copied_ids,
+            source_record,
+            state,
+            result,
         )
 
     console.print(
@@ -1407,7 +1486,7 @@ async def copy_videos_pooled(
     pending: list[int],
     temp_dir: Path,
     copied_ids: set[int],
-    record: dict[str, Any],
+    source_record: dict[str, Any],
     state: StateStore,
     result: BackupResult,
 ) -> None:
@@ -1454,7 +1533,7 @@ async def copy_videos_pooled(
                 )
                 async with lock:
                     copied_ids.add(message_id)
-                    record["copied_message_ids"] = sorted(copied_ids)
+                    source_record["copied_message_ids"] = sorted(copied_ids)
                     state.save()
                     result.copied += 1
                 tag = "linked" if mode == "linked" else "re-uploaded"
@@ -1623,56 +1702,88 @@ async def run() -> bool:
         if worker_count:
             pool.extend(await authenticate_workers(api_id, api_hash, worker_count))
 
-        raw_link = Prompt.ask("\n[bright_cyan]Shared folder link[/bright_cyan]")
-        slug = extract_folder_slug(raw_link)
-        imported = await import_shared_folder(client, slug)
+        raw_links = Prompt.ask(
+            "\n[bright_cyan]Shared folder link(s) — separate several with a "
+            "space or comma[/bright_cyan]"
+        )
+        slugs: list[str] = []
+        for piece in re.split(r"[\s,]+", raw_links.strip()):
+            if not piece:
+                continue
+            slug = extract_folder_slug(piece)
+            if slug not in slugs:
+                slugs.append(slug)
+        if not slugs:
+            raise ValueError("No shared folder link was provided.")
 
-        # Workers must be members of the source chats to download from them.
-        active_pool: list[Session] = [pool[0]]
-        for worker in pool[1:]:
-            if await ensure_folder_joined(worker, slug):
-                active_pool.append(worker)
-        if len(active_pool) > 1:
-            console.print(
-                f"[green]{len(active_pool)} sessions ready[/green] "
-                f"([bold]{', '.join(s.label for s in active_pool)}[/bold])"
-            )
-
-        state = StateStore(slug)
+        state = StateStore()
         results: list[BackupResult] = []
+        first_folder_title: str | None = None
         with tempfile.TemporaryDirectory(prefix="heartvault-") as temp:
             temp_dir = Path(temp)
-            for index, source in enumerate(imported.chats, start=1):
-                try:
-                    result = await backup_chat(
-                        active_pool,
-                        source,
-                        index,
-                        len(imported.chats),
-                        temp_dir,
-                        state,
-                    )
-                except (OSError, RPCError, RuntimeError, ValueError) as error:
-                    # One chat's failure must not abort the whole backup.
-                    title = utils.get_display_name(source) or "chat"
-                    console.print(
-                        f"[red]Chat '{escape(title)}' stopped: "
-                        f"{escape(str(error))}[/red]"
-                    )
-                    result = BackupResult(
-                        source_title=title,
-                        backup_title=backup_chat_title(title),
-                        destination=None,
-                        error=str(error),
-                    )
-                results.append(result)
+            # Process each folder in turn: finish one, then move to the next.
+            for folder_index, slug in enumerate(slugs, start=1):
+                console.rule(
+                    f"[bold bright_magenta]Folder {folder_index}/{len(slugs)}"
+                    f"[/bold bright_magenta]"
+                )
+                imported = await import_shared_folder(client, slug)
+                if first_folder_title is None:
+                    first_folder_title = imported.title
 
-        destinations = [
-            result.destination for result in results if result.destination is not None
-        ]
+                # Workers must join this folder's chats to download from them.
+                active_pool: list[Session] = [pool[0]]
+                for worker in pool[1:]:
+                    if await ensure_folder_joined(worker, slug):
+                        active_pool.append(worker)
+                if len(active_pool) > 1:
+                    console.print(
+                        f"[green]{len(active_pool)} sessions ready[/green] "
+                        f"([bold]{', '.join(s.label for s in active_pool)}[/bold])"
+                    )
+
+                for index, source in enumerate(imported.chats, start=1):
+                    try:
+                        result = await backup_chat(
+                            active_pool,
+                            source,
+                            index,
+                            len(imported.chats),
+                            temp_dir,
+                            state,
+                        )
+                    except (OSError, RPCError, RuntimeError, ValueError) as error:
+                        # One chat's failure must not abort the whole backup.
+                        title = utils.get_display_name(source) or "chat"
+                        console.print(
+                            f"[red]Chat '{escape(title)}' stopped: "
+                            f"{escape(str(error))}[/red]"
+                        )
+                        result = BackupResult(
+                            source_title=title,
+                            backup_title=backup_chat_title(title),
+                            destination=None,
+                            error=str(error),
+                        )
+                    results.append(result)
+                console.print(f"[green]Folder {folder_index} done[/green]")
+
+        # De-duplicate destinations: several sources may share one merged group.
+        seen_channels: set[int] = set()
+        destinations: list[Any] = []
+        for result in results:
+            channel = result.destination
+            if channel is None:
+                continue
+            channel_id = int(getattr(channel, "channel_id", getattr(channel, "id", 0)))
+            if channel_id in seen_channels:
+                continue
+            seen_channels.add(channel_id)
+            destinations.append(channel)
+
         folder_title, link = await create_backup_folder(
             client,
-            imported.title,
+            first_folder_title or "backup",
             destinations,
         )
         return show_summary(results, folder_title, link)
