@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import getpass
 import inspect
 import json
 import math
 import os
 import re
+import sys
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,7 +65,9 @@ from telethon.tl.types import chatlists as chatlist_types
 
 SESSION_FILE = "heartvault"
 STATE_FILE = ".heartvault_state.json"
-MAX_FLOOD_WAIT = 15 * 60
+# Short waits are absorbed; anything longer pauses that account and moves its
+# work to a healthy session instead of blocking or failing videos.
+MAX_FLOOD_WAIT = 90
 # Only videos at or below this size are backed up; larger ones are skipped.
 MAX_VIDEO_BYTES = 100 * 1024 * 1024
 # 512 KiB parts evenly divide Telegram's 1 MiB block and satisfy the upload
@@ -72,7 +77,7 @@ MAX_UPLOAD_PARTS = 4000
 # Extra connections opened per transfer. Each connection gets its own slice of
 # the file, so throughput scales roughly linearly with this until bandwidth or
 # Telegram throttling is the limit.
-MAX_TRANSFER_CONNECTIONS = 8
+MAX_TRANSFER_CONNECTIONS = 4
 # A single file part is retried this many times before the video is failed.
 # Telegram frequently times out or briefly drops individual part requests on
 # large transfers, and one slow part must not abort the whole file.
@@ -130,6 +135,8 @@ class Session:
     label: str
     user_id: int
     name: str = ""
+    # Monotonic timestamp until which this session is paused (Telegram throttle).
+    cooldown_until: float = 0.0
 
 
 @dataclass(slots=True)
@@ -315,6 +322,21 @@ def extract_folder_slug(raw_link: str) -> str:
     return slug
 
 
+class FloodTooLongError(RuntimeError):
+    """Raised when Telegram asks for a wait longer than we will tolerate.
+
+    Subclasses RuntimeError so existing handlers still catch it, while the
+    worker pool can catch it specifically to pause that account.
+    """
+
+    def __init__(self, seconds: int, label: str) -> None:
+        self.seconds = seconds
+        super().__init__(
+            f"Telegram requested a {seconds}s wait during {label}; "
+            "progress is saved, so rerun later to resume."
+        )
+
+
 async def rpc_call(
     label: str,
     operation: Callable[[], Awaitable[T]],
@@ -330,10 +352,7 @@ async def rpc_call(
         except FloodWaitError as error:
             wait_for = max(1, int(error.seconds)) + 1
             if wait_for > MAX_FLOOD_WAIT:
-                raise RuntimeError(
-                    f"Telegram requested a {wait_for}s wait during {label}; "
-                    "progress is saved, so rerun later to resume."
-                ) from error
+                raise FloodTooLongError(wait_for, label) from error
             console.log(
                 f"[yellow]Telegram rate limit:[/yellow] {escape(label)}; "
                 f"waiting {wait_for}s"
@@ -1030,9 +1049,10 @@ def connection_count(size: int) -> int:
         return min(MAX_TRANSFER_CONNECTIONS * 2, int(override))
     if size <= 0:
         return 1
-    # Roughly one connection per 16 MiB, bounded to a safe range.
-    scaled = math.ceil(size / (16 * 1024 * 1024))
-    return max(2, min(MAX_TRANSFER_CONNECTIONS, scaled))
+    # Gentle by default (~1 connection per 25 MiB) to avoid tripping Telegram's
+    # per-account throttle, which escalates into very long FloodWaits.
+    scaled = math.ceil(size / (25 * 1024 * 1024))
+    return max(1, min(MAX_TRANSFER_CONNECTIONS, scaled))
 
 
 async def open_transfer_senders(
@@ -1562,8 +1582,19 @@ async def backup_chat(
     # The owner only creates the group, invites and promotes the workers. To
     # keep the owner account clean, the actual posting is done exclusively by
     # the workers; the owner posts only as a fallback when no worker is usable.
-    if worker_entries:
-        copy_pool = worker_entries
+    now = time.monotonic()
+    ready_workers = [
+        entry for entry in worker_entries if entry[0].cooldown_until <= now
+    ]
+    if ready_workers:
+        copy_pool = ready_workers
+    elif worker_entries:
+        wait = int(min(s.cooldown_until for (s, _sp, _dp) in worker_entries) - now)
+        console.print(
+            f"[yellow]All workers are cooling down (~{max(0, wait)}s); skipping "
+            f"this chat for now — rerun later to finish it.[/yellow]"
+        )
+        copy_pool = []
     else:
         if pool[1:]:
             console.print(
@@ -1572,7 +1603,7 @@ async def backup_chat(
             )
         copy_pool = [(pool[0], source, destination)]
 
-    if pending:
+    if pending and copy_pool:
         posters = ", ".join(session.label for (session, _sp, _dp) in copy_pool)
         console.print(f"[dim]{len(pending)} video(s) · posting via {posters}[/dim]")
         await copy_videos_pooled(
@@ -1655,6 +1686,17 @@ async def copy_videos_pooled(
                 console.print(
                     f"  [green]✓[/green] video [bold]#{message_id}[/bold] {tag}{suffix}"
                 )
+            except (FloodWaitError, FloodTooLongError) as error:
+                # This account is throttled: pause it and hand the video back
+                # to a healthy session instead of burning it as a failure.
+                seconds = int(getattr(error, "seconds", MAX_FLOOD_WAIT))
+                session.cooldown_until = time.monotonic() + seconds
+                queue.put_nowait(message_id)
+                console.print(
+                    f"  [yellow]⏸ {session.label} throttled ~{seconds}s; pausing "
+                    f"it and requeuing video #{message_id}[/yellow]"
+                )
+                return
             except Exception as error:
                 # Never let one video stop the whole run; count it as failed so
                 # it is retried on the next resumable run.
@@ -1794,8 +1836,35 @@ async def disconnect_client(client: TelegramClient) -> None:
         await disconnect_result
 
 
+def _silence_shutdown_noise() -> None:
+    """Hide benign asyncio warnings from transfer connections closing.
+
+    The parallel-transfer senders and their background loops are torn down as
+    the run winds down; Python then complains about GC'd pending tasks and
+    ignored GeneratorExit. These are harmless, so we filter just those.
+    """
+
+    def loop_handler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if "Task was destroyed but it is pending" in context.get("message", ""):
+            return
+        loop.default_exception_handler(context)
+
+    with contextlib.suppress(RuntimeError):
+        asyncio.get_running_loop().set_exception_handler(loop_handler)
+
+    previous_hook = sys.unraisablehook
+
+    def unraisable_hook(unraisable: Any) -> None:
+        if isinstance(unraisable.exc_value, GeneratorExit):
+            return
+        previous_hook(unraisable)
+
+    sys.unraisablehook = unraisable_hook
+
+
 async def run() -> bool:
     banner()
+    _silence_shutdown_noise()
     pool: list[Session] = []
     try:
         client, main_me, api_id, api_hash = await authenticate()
