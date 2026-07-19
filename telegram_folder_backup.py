@@ -78,6 +78,8 @@ MAX_UPLOAD_PARTS = 4000
 # the file, so throughput scales roughly linearly with this until bandwidth or
 # Telegram throttling is the limit.
 MAX_TRANSFER_CONNECTIONS = 4
+# Maximum number of extra worker accounts that can share the workload.
+MAX_WORKERS = 10
 # A single file part is retried this many times before the video is failed.
 # Telegram frequently times out or briefly drops individual part requests on
 # large transfers, and one slow part must not abort the whole file.
@@ -1878,10 +1880,13 @@ async def run() -> bool:
         )
 
         worker_text = Prompt.ask(
-            "\n[bright_cyan]How many worker sessions to add (0-3)[/bright_cyan]",
+            f"\n[bright_cyan]How many worker sessions to add "
+            f"(0-{MAX_WORKERS})[/bright_cyan]",
             default="0",
         ).strip()
-        worker_count = min(3, int(worker_text)) if worker_text.isdigit() else 0
+        worker_count = (
+            min(MAX_WORKERS, int(worker_text)) if worker_text.isdigit() else 0
+        )
         if worker_count:
             pool.extend(await authenticate_workers(api_id, api_hash, worker_count))
 
