@@ -1416,6 +1416,32 @@ async def close_transfer_senders(senders: list[Any]) -> None:
             pass
 
 
+def is_video_message(message: Any) -> bool:
+    """True only for real video files. Photos are never a match.
+
+    Telegram's video search filter is trusted for the initial scan, but every
+    hop re-checks the message itself, so an image can never reach the backup
+    group: it must carry a document with a video attribute and a ``video/``
+    mime type, and must not be a photo or a sticker.
+    """
+    if message is None:
+        return False
+    if getattr(message, "photo", None) is not None:
+        return False
+    if getattr(message, "sticker", None) is not None:
+        return False
+    document = getattr(message, "document", None)
+    if document is None:
+        return False
+    attributes = getattr(document, "attributes", None) or []
+    if not any(
+        isinstance(attribute, types.DocumentAttributeVideo)
+        for attribute in attributes
+    ):
+        return False
+    return str(getattr(document, "mime_type", "") or "").lower().startswith("video/")
+
+
 def video_size(message: types.Message) -> int:
     document = getattr(cast(Any, message), "document", None)
     return int(getattr(document, "size", 0) or 0)
@@ -1575,6 +1601,10 @@ async def copy_video(
     temp_dir: Path,
     progress_ui: bool = True,
 ) -> str:
+    if not is_video_message(message):
+        # Last gate before anything is sent: only video files are copied.
+        raise RuntimeError(f"Message #{message.id} is not a video; not copied.")
+
     caption = video_caption(message.id)
 
     # Fast path: reuse Telegram's existing file reference so the server copies
@@ -1842,7 +1872,11 @@ async def backup_chat(
                 reverse=True,
                 filter=media_filter,
             ):
-                if not message.video or message.id in copied_ids or message.id in seen:
+                if (
+                    not is_video_message(message)
+                    or message.id in copied_ids
+                    or message.id in seen
+                ):
                     continue
                 seen.add(message.id)
                 size = video_size(message)
@@ -1986,7 +2020,7 @@ async def copy_videos_pooled(
                         ),
                     ),
                 )
-                if message is None or not getattr(message, "video", None):
+                if not is_video_message(message):
                     continue
                 mode = await copy_video(
                     session.client,
