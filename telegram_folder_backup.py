@@ -46,6 +46,7 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     InviteHashExpiredError,
     InviteHashInvalidError,
+    InviteRequestSentError,
     RPCError,
     ServerError,
     SessionPasswordNeededError,
@@ -80,6 +81,10 @@ MAX_UPLOAD_PARTS = 4000
 MAX_TRANSFER_CONNECTIONS = 4
 # Maximum number of extra worker accounts that can share the workload.
 MAX_WORKERS = 10
+# Minimum spacing between two join requests from the same run. Joining chats
+# back to back is what triggers Telegram's long join FloodWaits, so links are
+# consumed one by one with a small breather in between.
+JOIN_INTERVAL = 4.0
 # A single file part is retried this many times before the video is failed.
 # Telegram frequently times out or briefly drops individual part requests on
 # large transfers, and one slow part must not abort the whole file.
@@ -232,7 +237,7 @@ def banner() -> None:
         Panel(
             Align.center(
                 "[bold bright_magenta]H E A R T  V A U L T[/bold bright_magenta]\n"
-                "[dim]Telegram folder video backup · original quality[/dim]"
+                "[dim]Telegram group & folder video backup · original quality[/dim]"
             ),
             border_style="bright_magenta",
             padding=(1, 4),
@@ -297,31 +302,150 @@ def video_caption(message_id: int) -> str:
     return f"ᴠɪᴅᴇᴏ ~ {HEART} {message_id}"
 
 
-def extract_folder_slug(raw_link: str) -> str:
-    value = raw_link.strip()
-    if not value:
-        raise ValueError("The folder link cannot be empty.")
+TELEGRAM_HOSTS = {"t.me", "telegram.me", "telegram.dog"}
+# Finds shared-folder links inside free text (used to follow folder links that
+# a group advertises in its description).
+FOLDER_LINK_IN_TEXT = re.compile(
+    r"(?:https?://)?(?:www\.)?t(?:elegram)?\.(?:me|dog)/addlist/([A-Za-z0-9_-]+)"
+    r"|tg://addlist\?slug=([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 
-    if value.startswith("tg://"):
-        parsed = urlparse(value)
-        if parsed.netloc != "addlist":
-            raise ValueError("This is not a Telegram shared-folder link.")
-        slug = parse_qs(parsed.query).get("slug", [""])[0]
-    else:
-        if "://" not in value:
-            value = f"https://{value}"
-        parsed = urlparse(value)
-        host = parsed.netloc.lower().removeprefix("www.")
-        if host not in {"t.me", "telegram.me"}:
-            raise ValueError("Use a t.me/addlist/... shared-folder link.")
-        path_parts = [part for part in parsed.path.split("/") if part]
-        if len(path_parts) != 2 or path_parts[0].lower() != "addlist":
-            raise ValueError("Use a t.me/addlist/... shared-folder link.")
-        slug = path_parts[1]
 
+@dataclass(slots=True)
+class Target:
+    """One pasted link, normalized into something we can join.
+
+    ``kind`` is one of:
+      folder   – t.me/addlist/... shared folder (many chats at once)
+      public   – @username / t.me/username public group or channel
+      invite   – t.me/+hash or t.me/joinchat/hash private invite
+      internal – t.me/c/<id>/... link to a chat this account already knows
+    """
+
+    kind: str
+    value: str
+    label: str
+    origin: str = "paste"
+
+    @property
+    def key(self) -> str:
+        return f"{self.kind}:{self.value.lower()}"
+
+    @property
+    def is_folder(self) -> bool:
+        return self.kind == "folder"
+
+
+def _checked_slug(value: str, what: str) -> str:
+    slug = value.strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
-        raise ValueError("The shared-folder link has an invalid slug.")
+        raise ValueError(f"The {what} link has an invalid code.")
     return slug
+
+
+def _checked_username(value: str) -> str:
+    name = value.strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,31}", name):
+        raise ValueError("This is not a valid Telegram username or link.")
+    return name
+
+
+def parse_target(raw_link: str) -> Target:
+    """Normalize any pasted Telegram link into a joinable :class:`Target`."""
+    value = raw_link.strip().strip(",;")
+    if not value:
+        raise ValueError("The link cannot be empty.")
+
+    if value.lower().startswith("tg://"):
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query)
+        host = parsed.netloc.lower()
+        if host == "addlist":
+            return Target(
+                "folder", _checked_slug(query.get("slug", [""])[0], "shared-folder"), value
+            )
+        if host == "join":
+            return Target(
+                "invite", _checked_slug(query.get("invite", [""])[0], "invite"), value
+            )
+        if host == "resolve":
+            return Target(
+                "public", _checked_username(query.get("domain", [""])[0]), value
+            )
+        raise ValueError("This tg:// link is not a chat or folder link.")
+
+    if value.startswith("@"):
+        return Target("public", _checked_username(value), value)
+
+    looks_like_link = "://" in value or re.match(
+        r"(?:www\.)?t(?:elegram)?\.(?:me|dog)/", value, re.IGNORECASE
+    )
+    if not looks_like_link:
+        # Bare username pasted without any decoration.
+        return Target("public", _checked_username(value), value)
+
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = parsed.netloc.lower().removeprefix("www.")
+    if host not in TELEGRAM_HOSTS:
+        raise ValueError("Only t.me links are supported.")
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        raise ValueError("This t.me link points at no chat.")
+
+    first = parts[0]
+    lowered = first.lower()
+    if lowered == "addlist":
+        if len(parts) < 2:
+            raise ValueError("The shared-folder link has no code.")
+        return Target("folder", _checked_slug(parts[1], "shared-folder"), value)
+    if lowered == "joinchat":
+        if len(parts) < 2:
+            raise ValueError("The invite link has no code.")
+        return Target("invite", _checked_slug(parts[1], "invite"), value)
+    if first.startswith("+"):
+        return Target("invite", _checked_slug(first[1:], "invite"), value)
+    if lowered == "c" and len(parts) >= 2 and parts[1].isdigit():
+        return Target("internal", parts[1], value)
+    if lowered in {"s", "proxy", "socks", "share", "iv", "login"}:
+        if lowered == "s" and len(parts) >= 2:
+            return Target("public", _checked_username(parts[1]), value)
+        raise ValueError("This t.me link is not a chat link.")
+    return Target("public", _checked_username(first), value)
+
+
+def parse_target_list(raw: str) -> tuple[list[Target], list[str]]:
+    """Split a pasted blob into ordered, de-duplicated targets.
+
+    Returns the targets plus the pieces that could not be understood, so the
+    run can report them without stopping.
+    """
+    targets: list[Target] = []
+    rejected: list[str] = []
+    seen: set[str] = set()
+    for piece in re.split(r"[\s,]+", raw.strip()):
+        if not piece:
+            continue
+        try:
+            target = parse_target(piece)
+        except ValueError as error:
+            rejected.append(f"{piece} ({error})")
+            continue
+        if target.key in seen:
+            continue
+        seen.add(target.key)
+        targets.append(target)
+    return targets, rejected
+
+
+def folder_slugs_in_text(text: str) -> list[str]:
+    """Pull every shared-folder slug out of a chat description."""
+    slugs: list[str] = []
+    for match in FOLDER_LINK_IN_TEXT.finditer(text or ""):
+        slug = match.group(1) or match.group(2)
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs
 
 
 class FloodTooLongError(RuntimeError):
@@ -575,6 +699,143 @@ async def join_channels_individually(
             pass
 
 
+_last_join_at = 0.0
+
+
+async def pace_joins() -> None:
+    """Keep at least ``JOIN_INTERVAL`` seconds between two join requests."""
+    global _last_join_at
+    wait = JOIN_INTERVAL - (time.monotonic() - _last_join_at)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _last_join_at = time.monotonic()
+
+
+async def join_public_chat(
+    client: TelegramClient, username: str, label: str
+) -> types.Chat | types.Channel:
+    """Resolve a public @username and join it (no-op when already a member)."""
+    entity = cast(
+        Any,
+        await rpc_call(
+            f"{label}: resolve @{username}",
+            lambda: client.get_entity(username),
+        ),
+    )
+    if not isinstance(entity, (types.Chat, types.Channel)):
+        raise ValueError(f"@{username} is a user, not a group or channel.")
+    if isinstance(entity, types.Channel):
+        await pace_joins()
+        try:
+            await rpc_call(
+                f"{label}: join @{username}",
+                lambda: client(
+                    channels.JoinChannelRequest(
+                        cast(Any, utils.get_input_channel(entity))
+                    )
+                ),
+                retry_server_errors=False,
+            )
+        except UserAlreadyParticipantError:
+            pass
+    return entity
+
+
+async def join_invite_chat(
+    client: TelegramClient, invite_hash: str, label: str
+) -> types.Chat | types.Channel:
+    """Join a private chat from a t.me/+hash invite and return its entity."""
+    checked = cast(
+        Any,
+        await rpc_call(
+            f"{label}: check invite",
+            lambda: client(messages.CheckChatInviteRequest(invite_hash)),
+        ),
+    )
+    already = getattr(checked, "chat", None)
+    if isinstance(checked, types.ChatInviteAlready) and isinstance(
+        already, (types.Chat, types.Channel)
+    ):
+        return already
+
+    await pace_joins()
+    try:
+        updates = cast(
+            Any,
+            await rpc_call(
+                f"{label}: join private chat",
+                lambda: client(messages.ImportChatInviteRequest(invite_hash)),
+                retry_server_errors=False,
+            ),
+        )
+    except UserAlreadyParticipantError:
+        if isinstance(already, (types.Chat, types.Channel)):
+            return already
+        raise
+    except InviteRequestSentError as error:
+        raise RuntimeError(
+            "This chat needs admin approval; the join request was sent."
+        ) from error
+    for chat in getattr(updates, "chats", None) or []:
+        if isinstance(chat, (types.Chat, types.Channel)):
+            return chat
+    if isinstance(already, (types.Chat, types.Channel)):
+        return already
+    raise RuntimeError("Telegram accepted the invite but returned no chat.")
+
+
+async def join_target_chat(
+    client: TelegramClient, target: Target, label: str
+) -> types.Chat | types.Channel:
+    """Join (or resolve) one single-chat link and return its entity."""
+    if target.kind == "public":
+        return await join_public_chat(client, target.value, label)
+    if target.kind == "invite":
+        return await join_invite_chat(client, target.value, label)
+    if target.kind == "internal":
+        entity = cast(
+            Any,
+            await rpc_call(
+                f"{label}: resolve chat",
+                lambda: client.get_entity(types.PeerChannel(int(target.value))),
+            ),
+        )
+        if not isinstance(entity, (types.Chat, types.Channel)):
+            raise ValueError("That t.me/c/... link is not a group or channel.")
+        return entity
+    raise ValueError(f"'{target.label}' is not a single-chat link.")
+
+
+async def chat_description(client: TelegramClient, entity: Any) -> str:
+    """Best-effort read of a chat's About text (empty string when unavailable)."""
+    try:
+        if isinstance(entity, types.Channel):
+            full = cast(
+                Any,
+                await rpc_call(
+                    "read description",
+                    lambda: client(
+                        channels.GetFullChannelRequest(
+                            cast(Any, utils.get_input_channel(entity))
+                        )
+                    ),
+                ),
+            )
+        elif isinstance(entity, types.Chat):
+            full = cast(
+                Any,
+                await rpc_call(
+                    "read description",
+                    lambda: client(messages.GetFullChatRequest(chat_id=entity.id)),
+                ),
+            )
+        else:
+            return ""
+    except (RPCError, RuntimeError, ValueError, TypeError):
+        return ""
+    return str(getattr(getattr(full, "full_chat", None), "about", "") or "")
+
+
 async def chatlist_filter_ids(client: TelegramClient) -> set[int]:
     filters = cast(
         Any,
@@ -647,8 +908,11 @@ async def join_chatlist_transient(
     # Release our freshly imported folder too, keeping the channels, so the
     # slot is not held after this run.
     after = await chatlist_filter_ids(client)
-    for new_id in sorted(after - baseline):
+    dropped = sorted(after - baseline)
+    for new_id in dropped:
         await release_chatlist_slot(client, new_id, label)
+    if dropped:
+        console.print(f"[dim]{label}: folder view removed, chats kept[/dim]")
 
 
 async def import_shared_folder(client: TelegramClient, slug: str) -> ImportedFolder:
@@ -780,6 +1044,19 @@ async def ensure_folder_joined(session: Session, slug: str) -> bool:
         console.print(
             f"[yellow]{session.label} could not join the folder: "
             f"{escape(str(error))}[/yellow]"
+        )
+        return False
+
+
+async def ensure_chat_joined(session: Session, target: Target) -> bool:
+    """Best-effort: make a worker a member of one pasted group/channel link."""
+    try:
+        await join_target_chat(session.client, target, session.label)
+        return True
+    except (RPCError, RuntimeError, ValueError, TypeError) as error:
+        console.print(
+            f"[yellow]{session.label} could not join "
+            f"{escape(target.label)}: {escape(str(error))}[/yellow]"
         )
         return False
 
@@ -1873,6 +2150,88 @@ def show_summary(results: list[BackupResult], folder_title: str, link: str) -> b
     return complete
 
 
+def ask_links() -> str:
+    """Read a pasted block of links, one per line, ended by an empty line."""
+    console.print(
+        "\n[bright_cyan]Paste link(s)[/bright_cyan] [dim]groups · channels · "
+        "t.me/+invites · t.me/addlist folders — one per line, empty line to "
+        "start[/dim]"
+    )
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line.strip())
+    return "\n".join(lines)
+
+
+async def backup_sources(
+    active_pool: list[Session],
+    sources: Sequence[types.Chat | types.Channel],
+    temp_dir: Path,
+    state: StateStore,
+    results: list[BackupResult],
+) -> None:
+    """Back up every source chat in order; one chat's failure is isolated."""
+    total = len(sources)
+    for index, source in enumerate(sources, start=1):
+        try:
+            result = await backup_chat(
+                active_pool, source, index, total, temp_dir, state
+            )
+        except (OSError, RPCError, RuntimeError, ValueError) as error:
+            title = utils.get_display_name(source) or "chat"
+            console.print(
+                f"[red]Chat '{escape(title)}' stopped: {escape(str(error))}[/red]"
+            )
+            result = BackupResult(
+                source_title=title,
+                backup_title=backup_chat_title(title),
+                destination=None,
+                error=str(error),
+            )
+        results.append(result)
+
+
+async def queue_described_folders(
+    client: TelegramClient,
+    sources: Sequence[types.Chat | types.Channel],
+    queue: list[Target],
+    position: int,
+    seen: set[str],
+) -> int:
+    """Follow shared-folder links advertised in a chat's description.
+
+    Each folder found is inserted right after the link that mentioned it, so
+    it is handled next: join it, back it up, drop the folder view, then carry
+    on with the remaining pasted links.
+    """
+    added = 0
+    for source in sources:
+        about = await chat_description(client, source)
+        for slug in folder_slugs_in_text(about):
+            target = Target(
+                "folder", slug, f"https://t.me/addlist/{slug}", origin="description"
+            )
+            if target.key in seen:
+                continue
+            seen.add(target.key)
+            queue.insert(position + added, target)
+            added += 1
+            name = utils.get_display_name(source) or "chat"
+            console.print(
+                f"[bright_cyan]Folder link in {escape(name)}'s description:"
+                f"[/bright_cyan] {escape(target.label)}"
+            )
+    return added
+
+
 async def disconnect_client(client: TelegramClient) -> None:
     disconnect_result = cast(Any, client.disconnect())
     if inspect.isawaitable(disconnect_result):
@@ -1937,71 +2296,87 @@ async def run() -> bool:
                 f"\n[green]{len(pool) - 1} distinct worker account(s) ready[/green]"
             )
 
-        raw_links = Prompt.ask(
-            "\n[bright_cyan]Shared folder link(s) — separate several with a "
-            "space or comma[/bright_cyan]"
+        targets, rejected = parse_target_list(ask_links())
+        for bad in rejected:
+            console.print(f"[yellow]Not a Telegram chat link:[/yellow] {escape(bad)}")
+        if not targets:
+            raise ValueError("No usable Telegram chat or folder link was provided.")
+        folders = sum(1 for target in targets if target.is_folder)
+        console.print(
+            f"[green]{len(targets)} link(s) queued[/green] "
+            f"[dim]· {len(targets) - folders} chat · {folders} folder[/dim]"
         )
-        slugs: list[str] = []
-        for piece in re.split(r"[\s,]+", raw_links.strip()):
-            if not piece:
-                continue
-            slug = extract_folder_slug(piece)
-            if slug not in slugs:
-                slugs.append(slug)
-        if not slugs:
-            raise ValueError("No shared folder link was provided.")
 
         state = StateStore()
         results: list[BackupResult] = []
-        first_folder_title: str | None = None
+        first_title: str | None = None
+        seen_keys = {target.key for target in targets}
         with tempfile.TemporaryDirectory(prefix="heartvault-") as temp:
             temp_dir = Path(temp)
-            # Process each folder in turn: finish one, then move to the next.
-            for folder_index, slug in enumerate(slugs, start=1):
+            position = 0
+            # One link at a time: join it, back it up, then move to the next.
+            # ``targets`` can grow while looping when a chat's description
+            # points at a shared folder; that folder is handled next.
+            while position < len(targets):
+                target = targets[position]
+                position += 1
                 console.rule(
-                    f"[bold bright_magenta]Folder {folder_index}/{len(slugs)}"
-                    f"[/bold bright_magenta]"
+                    f"[bold bright_magenta]Link {position}/{len(targets)}"
+                    f"[/bold bright_magenta] [bold]{escape(target.label)}[/bold]"
                 )
-                imported = await import_shared_folder(client, slug)
-                if first_folder_title is None:
-                    first_folder_title = imported.title
 
-                # Workers must join this folder's chats to download from them.
+                sources: list[types.Chat | types.Channel]
                 active_pool: list[Session] = [pool[0]]
-                for worker in pool[1:]:
-                    if await ensure_folder_joined(worker, slug):
-                        active_pool.append(worker)
+                if target.is_folder:
+                    try:
+                        imported = await import_shared_folder(client, target.value)
+                    except (RPCError, RuntimeError, ValueError) as error:
+                        console.print(
+                            f"[red]Folder skipped:[/red] {escape(str(error))}"
+                        )
+                        continue
+                    sources = list(imported.chats)
+                    title = imported.title
+                    # Workers must join the folder's chats to download them.
+                    for worker in pool[1:]:
+                        if await ensure_folder_joined(worker, target.value):
+                            active_pool.append(worker)
+                else:
+                    try:
+                        entity = await join_target_chat(client, target, "Main")
+                    except (RPCError, RuntimeError, ValueError, TypeError) as error:
+                        console.print(
+                            f"[red]Skipped {escape(target.label)}:[/red] "
+                            f"{escape(str(error))}"
+                        )
+                        continue
+                    sources = [entity]
+                    title = utils.get_display_name(entity) or target.label
+                    console.print(f"[green]Joined:[/green] [bold]{escape(title)}[/bold]")
+                    for worker in pool[1:]:
+                        if await ensure_chat_joined(worker, target):
+                            active_pool.append(worker)
+
+                if first_title is None:
+                    first_title = title
                 if len(active_pool) > 1:
                     console.print(
                         f"[green]{len(active_pool)} sessions ready[/green] "
                         f"([bold]{', '.join(s.label for s in active_pool)}[/bold])"
                     )
 
-                for index, source in enumerate(imported.chats, start=1):
-                    try:
-                        result = await backup_chat(
-                            active_pool,
-                            source,
-                            index,
-                            len(imported.chats),
-                            temp_dir,
-                            state,
-                        )
-                    except (OSError, RPCError, RuntimeError, ValueError) as error:
-                        # One chat's failure must not abort the whole backup.
-                        title = utils.get_display_name(source) or "chat"
-                        console.print(
-                            f"[red]Chat '{escape(title)}' stopped: "
-                            f"{escape(str(error))}[/red]"
-                        )
-                        result = BackupResult(
-                            source_title=title,
-                            backup_title=backup_chat_title(title),
-                            destination=None,
-                            error=str(error),
-                        )
-                    results.append(result)
-                console.print(f"[green]Folder {folder_index} done[/green]")
+                await backup_sources(active_pool, sources, temp_dir, state, results)
+
+                if target.origin == "paste":
+                    # Descriptions are only followed one level deep, so a
+                    # followed folder cannot chain into further folders.
+                    await queue_described_folders(
+                        client, sources, targets, position, seen_keys
+                    )
+                console.print(f"[green]Done:[/green] {escape(target.label)}")
+
+        if not results:
+            raise RuntimeError("None of the pasted links could be opened.")
 
         # De-duplicate destinations: several sources may share one merged group.
         seen_channels: set[int] = set()
@@ -2018,7 +2393,7 @@ async def run() -> bool:
 
         folder_title, link = await create_backup_folder(
             client,
-            first_folder_title or "backup",
+            first_title or "backup",
             destinations,
         )
         return show_summary(results, folder_title, link)
