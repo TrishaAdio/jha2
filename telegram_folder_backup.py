@@ -414,18 +414,44 @@ def parse_target(raw_link: str) -> Target:
     return Target("public", _checked_username(first), value)
 
 
-def parse_target_list(raw: str) -> tuple[list[Target], list[str]]:
-    """Split a pasted blob into ordered, de-duplicated targets.
+# Pulls links out of arbitrary pasted text (channel adverts, forwarded posts,
+# lists with emoji and captions around them). Matches t.me/telegram.me URLs
+# with or without a scheme, tg:// deep links, and @usernames.
+LINK_IN_TEXT = re.compile(
+    r"""
+      tg://(?:addlist|join|resolve)\?[A-Za-z0-9_=&%\-]+
+    | (?:https?://)?(?:www\.)?t(?:elegram)?\.(?:me|dog)/[^\s<>"'`)\]}\u2019,]+
+    | (?<![\w@./+-])@[A-Za-z][A-Za-z0-9_]{3,31}
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+# Sentence punctuation that commonly hugs a pasted link. '-' and '_' are left
+# alone because invite hashes may legitimately end with them.
+LINK_TRAILING_JUNK = ".,;:!?\"'`)]}>*|«»\u2018\u2019\u201c\u201d\u2026"
 
-    Returns the targets plus the pieces that could not be understood, so the
-    run can report them without stopping.
+
+def find_links(text: str) -> list[str]:
+    """Extract every Telegram link from free-form pasted text, in order."""
+    found: list[str] = []
+    for match in LINK_IN_TEXT.finditer(text or ""):
+        candidate = match.group(0).strip().rstrip(LINK_TRAILING_JUNK)
+        if candidate:
+            found.append(candidate)
+    return found
+
+
+def parse_target_list(raw: str) -> tuple[list[Target], list[str]]:
+    """Turn a pasted blob into ordered, de-duplicated targets.
+
+    The text does not need to be a clean list: links are picked out of
+    whatever was pasted. Returns the targets plus any link that looked like a
+    Telegram link but could not be understood, so the run can report it
+    without stopping.
     """
     targets: list[Target] = []
     rejected: list[str] = []
     seen: set[str] = set()
-    for piece in re.split(r"[\s,]+", raw.strip()):
-        if not piece:
-            continue
+    for piece in find_links(raw):
         try:
             target = parse_target(piece)
         except ValueError as error:
@@ -2184,24 +2210,40 @@ def show_summary(results: list[BackupResult], folder_title: str, link: str) -> b
     return complete
 
 
+FINISH_WORDS = {".", "go", "done", "end", "ok"}
+
+
 def ask_links() -> str:
-    """Read a pasted block of links, one per line, ended by an empty line."""
+    """Read pasted text of any shape; the links are pulled out of it later.
+
+    Blank lines are kept, since pasted adverts and forwarded posts contain
+    them. The block ends on two blank lines in a row, a lone '.', or EOF.
+    """
     console.print(
-        "\n[bright_cyan]Paste link(s)[/bright_cyan] [dim]groups · channels · "
-        "t.me/+invites · t.me/addlist folders — one per line, empty line to "
-        "start[/dim]"
+        "\n[bright_cyan]Paste anything with Telegram links in it[/bright_cyan] "
+        "[dim]— links are picked out of the text; press Enter twice (or a "
+        "single '.') when done[/dim]"
     )
     lines: list[str] = []
+    blanks = 0
     while True:
         try:
             line = input()
         except EOFError:
             break
-        if not line.strip():
-            if lines:
+        stripped = line.strip()
+        if stripped.lower() in FINISH_WORDS and lines:
+            break
+        if not stripped:
+            if not lines:
+                continue
+            blanks += 1
+            if blanks >= 2:
                 break
+            lines.append("")
             continue
-        lines.append(line.strip())
+        blanks = 0
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -2337,7 +2379,7 @@ async def run() -> bool:
             raise ValueError("No usable Telegram chat or folder link was provided.")
         folders = sum(1 for target in targets if target.is_folder)
         console.print(
-            f"[green]{len(targets)} link(s) queued[/green] "
+            f"[green]{len(targets)} link(s) found[/green] "
             f"[dim]· {len(targets) - folders} chat · {folders} folder[/dim]"
         )
 
