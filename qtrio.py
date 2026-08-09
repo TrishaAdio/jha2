@@ -55,6 +55,7 @@ from telethon.tl.functions import channels, messages
 from telegram_folder_backup import (
     HEART,
     MAX_FLOOD_WAIT,
+    TITLE_SUFFIX,
     FloodTooLongError,
     Session,
     Target,
@@ -120,6 +121,16 @@ class Crew:
     # Resolving the reader by @username lets a maker invite it without the two
     # accounts ever having shared a chat before.
     reader_username: str | None = None
+
+
+@dataclass(slots=True)
+class Candidate:
+    """One group or channel the reader account is already sitting in."""
+
+    entity: types.Chat | types.Channel
+    title: str
+    kind: str
+    mirrored: bool
 
 
 @dataclass(slots=True)
@@ -409,6 +420,169 @@ async def authenticate_crew() -> Crew:
         f"[dim]({', '.join(maker.label for maker in crew.makers)})[/dim]"
     )
     return crew
+
+
+def mirror_channel_ids(state: QtrioState) -> set[int]:
+    """Channel ids this tool created, so they are never mirrored into again."""
+    ids: set[int] = set()
+    for group in state.groups.values():
+        try:
+            ids.add(int(group["channel_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ids
+
+
+def is_own_output(title: str, peer_id: int, made_ids: set[int]) -> bool:
+    """True for a group this tool (or the backup script) produced.
+
+    Without this the reader's own destination groups show up as sources and the
+    run mirrors its output back into itself. Ids cover this tool's groups; the
+    title suffix also catches groups made by ``telegram_folder_backup.py``.
+    """
+    if peer_id in made_ids:
+        return True
+    return title.rstrip().endswith(TITLE_SUFFIX.strip())
+
+
+async def fetch_reader_groups(crew: Crew, state: QtrioState) -> list[Candidate]:
+    """List every group and channel the reader account is already a member of.
+
+    Telegram returns dialogs most-recent-first, and that order is kept, so the
+    chats worth mirroring tend to be at the top of the list.
+    """
+    made_ids = mirror_channel_ids(state)
+    candidates: list[Candidate] = []
+    seen: set[int] = set()
+    console.print("[dim]Reading the reader account's chat list…[/dim]")
+    async for dialog in crew.reader.client.iter_dialogs():
+        entity = dialog.entity
+        # Users and bots are not sources; forbidden and dead chats cannot be read.
+        if not isinstance(entity, (types.Chat, types.Channel)):
+            continue
+        if getattr(entity, "deactivated", False):
+            continue
+        peer_id = utils.get_peer_id(entity)
+        if peer_id in seen:
+            continue
+        title = utils.get_display_name(entity) or f"Chat {peer_id}"
+        if is_own_output(title, int(getattr(entity, "id", 0)), made_ids):
+            continue
+        seen.add(peer_id)
+        if isinstance(entity, types.Channel) and not entity.megagroup:
+            kind = "channel"
+        else:
+            kind = "group"
+        candidates.append(
+            Candidate(
+                entity=entity,
+                title=title,
+                kind=kind,
+                mirrored=brand_key(title) in state.groups,
+            )
+        )
+    return candidates
+
+
+def show_candidates(candidates: Sequence[Candidate]) -> None:
+    table = Table(
+        title=f"Groups the reader is in ({len(candidates)})",
+        border_style="bright_magenta",
+        header_style="bold bright_magenta",
+    )
+    table.add_column("#", justify="right")
+    table.add_column("Title")
+    table.add_column("Kind")
+    table.add_column("Mirrored")
+    for number, candidate in enumerate(candidates, start=1):
+        table.add_row(
+            str(number),
+            escape(candidate.title),
+            candidate.kind,
+            "yes" if candidate.mirrored else "-",
+        )
+    console.print(table)
+
+
+def parse_selection(raw: str, count: int) -> list[int]:
+    """Turn "all" or "1,4,7-12" into zero-based indexes, order preserved."""
+    cleaned = raw.strip().lower()
+    if not cleaned or cleaned in {"all", "*"}:
+        return list(range(count))
+    chosen: list[int] = []
+    for piece in re.split(r"[\s,]+", cleaned):
+        if not piece:
+            continue
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", piece)
+        if not match:
+            raise ValueError(f"'{piece}' is not a number or a range like 4-9.")
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start < 1 or end > count or end < start:
+            raise ValueError(f"'{piece}' is outside 1-{count}.")
+        chosen.extend(range(start - 1, end))
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for index in chosen:
+        if index not in seen:
+            seen.add(index)
+            ordered.append(index)
+    if not ordered:
+        raise ValueError("Nothing was selected.")
+    return ordered
+
+
+async def choose_sources(
+    crew: Crew, state: QtrioState
+) -> list[types.Chat | types.Channel]:
+    """Pick sources from the reader's own chat list, or from pasted links."""
+    console.print("\n[bold bright_magenta]Sources[/bold bright_magenta]")
+    try:
+        candidates = await fetch_reader_groups(crew, state)
+    except (RPCError, RuntimeError) as error:
+        console.print(
+            f"[yellow]Could not read the reader's chat list "
+            f"({escape(str(error))}); paste links instead.[/yellow]"
+        )
+        return await sources_from_links(crew)
+
+    if not candidates:
+        console.print(
+            "[yellow]The reader account is not in any group or channel yet."
+            "[/yellow]"
+        )
+        return await sources_from_links(crew)
+
+    show_candidates(candidates)
+    while True:
+        raw = Prompt.ask(
+            "[bright_cyan]Which ones[/bright_cyan] [dim]· all · 1,4,7-12 · "
+            "'links' to paste links instead[/dim]",
+            default="all",
+        ).strip()
+        if raw.lower() in {"links", "link", "paste"}:
+            return await sources_from_links(crew)
+        try:
+            picked = parse_selection(raw, len(candidates))
+        except ValueError as error:
+            console.print(f"[yellow]{escape(str(error))}[/yellow]")
+            continue
+        return [candidates[index].entity for index in picked]
+
+
+async def sources_from_links(crew: Crew) -> list[types.Chat | types.Channel]:
+    """The original path: paste links and let the reader join them."""
+    targets, rejected = parse_target_list(ask_links())
+    for bad in rejected:
+        console.print(f"[yellow]Not a Telegram chat link:[/yellow] {escape(bad)}")
+    if not targets:
+        raise ValueError("No usable Telegram chat or folder link was provided.")
+    folders = sum(1 for target in targets if target.is_folder)
+    console.print(
+        f"[green]{len(targets)} link(s) queued[/green] "
+        f"[dim]· {len(targets) - folders} chat · {folders} folder[/dim]"
+    )
+    return await collect_sources(crew, targets)
 
 
 async def collect_sources(
@@ -915,26 +1089,18 @@ async def run() -> bool:
     try:
         crew = await authenticate_crew()
 
-        targets, rejected = parse_target_list(ask_links())
-        for bad in rejected:
-            console.print(f"[yellow]Not a Telegram chat link:[/yellow] {escape(bad)}")
-        if not targets:
-            raise ValueError("No usable Telegram chat or folder link was provided.")
-        folders = sum(1 for target in targets if target.is_folder)
-        console.print(
-            f"[green]{len(targets)} link(s) queued[/green] "
-            f"[dim]· {len(targets) - folders} chat · {folders} folder[/dim]"
-        )
+        # Loaded before the sources are picked so the groups this tool already
+        # made can be filtered out of the reader's chat list.
+        state = QtrioState()
 
-        sources = await collect_sources(crew, targets)
+        sources = await choose_sources(crew, state)
         if not sources:
-            raise RuntimeError("None of the pasted links could be opened.")
+            raise RuntimeError("No source chat was selected.")
         console.print(
             f"\n[green]{len(sources)} source chat(s) ready[/green] "
             f"[dim]· forwarding with the sender name hidden[/dim]"
         )
 
-        state = QtrioState()
         pool = MakerPool(crew.makers)
         results = await mirror_sources(crew, pool, sources, state)
 
