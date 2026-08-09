@@ -3,6 +3,8 @@
 *.session-journal
 .heartvault_state.json
 .heartvault_state.tmp
+.qtrio_state.json
+.qtrio_state.tmp
 
 # Python
 __pycache__/
@@ -12,6 +14,12 @@ __pycache__/
 # Worker sessions
 heartvault_worker*.session
 heartvault_worker*.session-journal
+
+# qtrio reader / maker sessions
+qtrio_reader*.session
+qtrio_reader*.session-journal
+qtrio_maker*.session
+qtrio_maker*.session-journal
 
 # Local temporary media
 heartvault-*/
