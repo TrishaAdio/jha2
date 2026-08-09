@@ -535,6 +535,29 @@ async def finish_otp_login(client: TelegramClient, phone: str) -> None:
             return
 
 
+def ask_phone(role: str) -> str:
+    """Prompt until the number is one Telegram will actually accept.
+
+    Telethon quietly turns an unusable number into ``None`` and only fails much
+    later, deep inside serialization, with "bytes or str expected, not
+    NoneType". Checking it here keeps that confusing traceback away from a
+    simple typo or an empty line.
+    """
+    for _ in range(3):
+        raw = Prompt.ask(
+            f"[bright_cyan]{role} phone number[/bright_cyan] "
+            f"[dim](with country code)[/dim]"
+        )
+        phone = utils.parse_phone(raw)
+        if phone:
+            return phone
+        console.print(
+            "[yellow]That is not a usable number. Include the country code, "
+            "for example +911234567890.[/yellow]"
+        )
+    raise ValueError(f"No usable {role} phone number was entered.")
+
+
 async def login_client(
     session_name: str, api_id: int, api_hash: str, role: str
 ) -> tuple[TelegramClient, Any]:
@@ -543,9 +566,7 @@ async def login_client(
     await client.connect()
 
     if not await client.is_user_authorized():
-        phone = Prompt.ask(
-            f"[bright_cyan]{role} phone number[/bright_cyan]", default="+"
-        )
+        phone = ask_phone(role)
         await rpc_call("send login code", lambda: client.send_code_request(phone))
         await finish_otp_login(client, phone)
 
