@@ -5,6 +5,8 @@
 .heartvault_state.tmp
 .qtrio_state.json
 .qtrio_state.tmp
+.final_state.json
+.final_state.tmp
 
 # Python
 __pycache__/
@@ -21,5 +23,12 @@ qtrio_reader*.session-journal
 qtrio_maker*.session
 qtrio_maker*.session-journal
 
+# Final owner / worker sessions
+final.session
+final.session-journal
+final_worker*.session
+final_worker*.session-journal
+
 # Local temporary media
 heartvault-*/
+final-*/
