@@ -145,8 +145,10 @@ SESSION_FILE = "final"
 STATE_FILE = ".final_state.json"
 # The terminal menu refuses to start on more than this many groups per run.
 MAX_GROUPS = 10
-# Extra accounts that upload alongside the owner, each one anonymous.
-MAX_WORKERS = 10
+# Extra accounts that upload alongside the owner, each one anonymous. Upload
+# throughput is metered per account, so the number of accounts is what sets the
+# ceiling for a protected source whose bytes must be moved.
+MAX_WORKERS = 30
 # Telegram's own ceilings. Titles and ranks are measured in UTF-16 units
 # because every italic-sans letter is a surrogate pair and so costs two.
 TITLE_LIMIT = 128
@@ -192,6 +194,11 @@ MAX_PARALLEL_VIDEOS = 4
 # Telegram's ceiling for a single downloaded file part. Uploads are capped at
 # PART_SIZE (512 KiB), so one download feeds exactly two uploads.
 DOWNLOAD_PART = 1024 * 1024
+# Message ids per forwardMessages call, which is Telegram's own cap. One call
+# moves this many videos and no bytes at all, so a source that allows
+# forwarding finishes in the time a handful of re-uploads would take.
+FORWARD_BATCH = 100
+FORWARD_INTERVAL = 1.0
 # A worker that keeps failing is ejected after this many consecutive errors, so
 # a broken account cannot drain the queue and fail every video in it.
 MAX_CONSECUTIVE_FAILURES = 3
@@ -2684,6 +2691,123 @@ async def verified_dest_peer(
     return peer
 
 
+async def reader_dest_peer(
+    owner: Worker,
+    reader: Worker,
+    destination: Any,
+    channel_id: int,
+    invite_link: str | None,
+    inviters: list[Worker],
+) -> Any | None:
+    """A destination handle for the reader, so it can try forwarding.
+
+    Forwarding needs one account that is in both chats. The reader is the one
+    that can see the source, so it is the only candidate; this gets it into the
+    destination as an anonymous admin like any uploader.
+    """
+    if reader.user_id == owner.user_id:
+        return destination
+    attached = await attach_worker_to_group(
+        cast(Any, inviters), reader, destination, channel_id, invite_link
+    )
+    if attached is None:
+        return None
+    if not await promote_anonymous(owner.client, destination, reader):
+        return None
+    return await verified_dest_peer(reader, channel_id, attached)
+
+
+async def forward_all(
+    reader: Worker,
+    dest_peer: Any,
+    source_peer: Any,
+    plan: Plan,
+    state: FinalState,
+    eta: Eta,
+    dashboard: Dashboard,
+    result: GroupResult,
+) -> bool:
+    """Move a whole source by forwarding, if Telegram will allow it.
+
+    A forward moves no bytes: the server repoints the existing file, so a
+    hundred videos cost one request and a 100 MB video costs the same as a
+    1 MB one. ``drop_author`` removes the "forwarded from" header, and an
+    anonymous admin's forwards are signed as the group, so the result looks the
+    same as an upload.
+
+    Returns ``False`` without side effects when the source restricts saving, so
+    the caller can fall back to moving the bytes. This is checked rather than
+    assumed because the difference is minutes against hours.
+
+    One trade-off: a forward keeps the original caption, so these messages carry
+    no ``video ~ 💗 id`` marker and the caption scan cannot recover them. The
+    state file is what makes a rerun resume, and it is written per batch.
+    """
+    pending = list(plan.pending)
+    if not pending:
+        return True
+    sizes = dict(pending)
+    ids = [message_id for message_id, _size in pending]
+    task = dashboard.lane(f"{reader.label} forward")
+    dashboard.transfer.reset(
+        task, description=f"{reader.label} forwarding", total=len(ids), start=True
+    )
+    done = 0
+    try:
+        for start in range(0, len(ids), FORWARD_BATCH):
+            batch = ids[start : start + FORWARD_BATCH]
+
+            async def send(current: list[int] = batch) -> Any:
+                return await reader.client.forward_messages(
+                    dest_peer,
+                    current,
+                    from_peer=source_peer,
+                    drop_author=True,
+                    silent=True,
+                )
+
+            try:
+                sent = cast(
+                    Any,
+                    await rpc_call(
+                        f"{reader.label}: forward {len(batch)}",
+                        send,
+                        retry_server_errors=False,
+                    ),
+                )
+            except ChatForwardsRestrictedError:
+                if done == 0:
+                    # Protected source: nothing happened, so the caller can
+                    # fall back to re-uploading without any double-send.
+                    return False
+                raise
+            landed = (
+                sum(1 for message in sent if message is not None)
+                if isinstance(sent, (list, tuple))
+                else (1 if sent is not None else 0)
+            )
+            for message_id in batch:
+                await state.mark_copied(
+                    plan.brand, plan.key, plan.title, message_id
+                )
+            result.copied += landed
+            result.skipped += len(batch) - landed
+            reader.copied += landed
+            for message_id in batch:
+                eta.complete(sizes.get(message_id, 0))
+            done += len(batch)
+            dashboard.transfer.update(task, completed=done)
+            dashboard.advance()
+            console.print(
+                f"  [green]✓[/green] {landed}/{len(batch)} forwarded "
+                f"[dim]· {reader.label}[/dim]"
+            )
+            await asyncio.sleep(FORWARD_INTERVAL)
+        return True
+    finally:
+        dashboard.transfer.remove_task(task)
+
+
 async def pick_reader(
     owner: Worker,
     pool: Sequence[Worker],
@@ -2962,6 +3086,40 @@ async def run_group(
             f"{sum(w.upload_lanes for w in uploading)} upload socket(s) of "
             f"{connection_budget()} budget[/dim]"
         )
+        # Forwarding costs nothing, so it is worth one request to find out
+        # whether this source permits it before moving a single byte.
+        if not bool(getattr(plan.source, "noforwards", False)):
+            forward_peer = await reader_dest_peer(
+                owner, reader, destination, channel_id, result.invite_link,
+                inviters,
+            )
+            if forward_peer is not None:
+                console.print(
+                    f"[dim]checking whether {escape(plan.title)} allows "
+                    f"forwarding…[/dim]"
+                )
+                if await forward_all(
+                    reader,
+                    forward_peer,
+                    reader_source,
+                    plan,
+                    state,
+                    eta,
+                    dashboard,
+                    result,
+                ):
+                    console.print(
+                        f"[green]{escape(plan.title)} allows forwarding — "
+                        f"copied with no bytes moved.[/green]"
+                    )
+                    for relay in relays:
+                        dashboard.transfer.remove_task(relay.lane)
+                    continue
+                console.print(
+                    f"[dim]{escape(plan.title)} restricts saving, so its bytes "
+                    f"have to be moved.[/dim]"
+                )
+
         pointer = PointerState(
             allowed=not bool(getattr(plan.source, "noforwards", False))
         )
