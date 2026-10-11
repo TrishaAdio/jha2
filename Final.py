@@ -41,7 +41,9 @@ from __future__ import annotations
 import asyncio
 import getpass
 import contextlib
+import itertools
 import json
+import logging
 import math
 import os
 import re
@@ -169,6 +171,14 @@ MAX_CONNECTIONS = 16
 # more uploader accounts, not more sockets on one.
 DEFAULT_READER_CONNECTIONS = 8
 DEFAULT_PREMIUM_READER_CONNECTIONS = 16
+# Total sockets this host opens to Telegram across every account. Past roughly
+# this many, Telegram starts resetting connections instead of serving them, and
+# each reset costs a retried part, so a bigger number transfers less. Divided
+# between the reader and the uploaders at roster time.
+DEFAULT_CONNECTION_BUDGET = 28
+# In-flight requests per video, per direction. The pool-wide gate is what
+# actually bounds concurrency; this only decides how many tasks queue for it.
+LANES_PER_VIDEO = 4
 # Videos one account copies at the same time. These share the account's
 # connections rather than adding any, so raising it makes each video slower
 # without making the run faster. One keeps the per-video ETA honest.
@@ -319,6 +329,8 @@ class Worker(Session):
     username: str = ""
     phone: str = ""
     premium: bool = False
+    download_lanes: int = 0
+    upload_lanes: int = 0
     transport: Any = None
 
 
@@ -1603,6 +1615,33 @@ async def worker_source_peer(
 # so no video pays for an MTProto handshake.
 
 
+def connection_budget() -> int:
+    """Total sockets to Telegram. Override with FINAL_TOTAL_CONNECTIONS."""
+    raw = os.environ.get("FINAL_TOTAL_CONNECTIONS", "")
+    if raw.isdigit() and int(raw) > 0:
+        return max(4, int(raw))
+    return DEFAULT_CONNECTION_BUDGET
+
+
+def allocate_lanes(reader: Worker, uploaders: Sequence[Worker]) -> None:
+    """Split the socket budget between the reader and the uploading accounts.
+
+    Opening sockets per account without regard to how many accounts there are
+    is what produced the connection resets: eight accounts at the old defaults
+    asked for 44 at once. Uploads are metered per account, so a couple of lanes
+    each is already near that account's ceiling and the rest of the budget is
+    better spent on the reader, whose Premium download is not metered.
+    """
+    budget = connection_budget()
+    count = max(1, len(uploaders))
+    per_upload = max(2, min(transfer_connections(), (budget // 2) // count))
+    for session in uploaders:
+        session.upload_lanes = per_upload
+    reader.download_lanes = max(
+        4, min(reader_connections(reader), budget - per_upload * count)
+    )
+
+
 def reader_connections(session: Worker) -> int:
     """Download lanes for an account. Premium has no speed cap, so it gets more.
 
@@ -1614,6 +1653,47 @@ def reader_connections(session: Worker) -> int:
     if session.premium:
         return DEFAULT_PREMIUM_READER_CONNECTIONS
     return DEFAULT_READER_CONNECTIONS
+
+
+class ConnectionNoise(logging.Filter):
+    """Collapse Telethon's connection churn into a count.
+
+    With many transfer sockets open, Telegram drops some and Telethon
+    reconnects; a reply already in flight then arrives against the old session
+    and is discarded as a security error. ``call_part`` retries the part, so
+    none of it is a failure the user can act on, but one log line per event
+    buried the actual progress. They are counted and reported once instead.
+    """
+
+    PATTERNS = (
+        "wrong session ID",
+        "Security error while unpacking",
+        "Server closed the connection",
+        "Connection reset by peer",
+        "Broken pipe",
+        "Connection to Telegram failed",
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a bad log record must not stop a run
+            return True
+        if any(pattern in message for pattern in self.PATTERNS):
+            self.count += 1
+            return False
+        return True
+
+
+CONNECTION_NOISE = ConnectionNoise()
+
+
+def quiet_connection_noise() -> None:
+    logging.getLogger("telethon").addFilter(CONNECTION_NOISE)
 
 
 def transfer_connections() -> int:
@@ -1642,6 +1722,11 @@ class Transport:
         self._download: dict[int, list[Any]] = {}
         self._upload: list[Any] | None = None
         self._guard = asyncio.Lock()
+        # One permit per socket, so however many videos are in flight the pool
+        # is never asked for more requests at once than it has connections.
+        self._download_gate: dict[int, asyncio.Semaphore] = {}
+        self._upload_gate: asyncio.Semaphore | None = None
+        self._turn = itertools.count()
 
     async def download_senders(self, dc_id: int) -> list[Any]:
         async with self._guard:
@@ -1651,6 +1736,7 @@ class Transport:
                     self.client, dc_id, self.download_count
                 )
                 self._download[dc_id] = senders
+                self._download_gate[dc_id] = asyncio.Semaphore(len(senders))
             return senders
 
     async def upload_senders(self) -> list[Any]:
@@ -1660,12 +1746,29 @@ class Transport:
                 self._upload = await open_transfer_senders(
                     self.client, own_dc, self.upload_count
                 )
+                self._upload_gate = asyncio.Semaphore(len(self._upload))
             return self._upload
+
+    async def fetch(self, dc_id: int, request: Any, label: str) -> Any:
+        """Run one download request on a free connection from the pool."""
+        senders = await self.download_senders(dc_id)
+        async with self._download_gate[dc_id]:
+            sender = senders[next(self._turn) % len(senders)]
+            return await call_part(self.client, sender, request, label)
+
+    async def push(self, request: Any, label: str) -> Any:
+        """Run one upload request on a free connection from the pool."""
+        senders = await self.upload_senders()
+        assert self._upload_gate is not None
+        async with self._upload_gate:
+            sender = senders[next(self._turn) % len(senders)]
+            return await call_part(self.client, sender, request, label)
 
     async def close(self) -> None:
         for senders in self._download.values():
             await close_transfer_senders(senders)
         self._download.clear()
+        self._download_gate.clear()
         if self._upload is not None:
             await close_transfer_senders(self._upload)
             self._upload = None
@@ -1675,7 +1778,9 @@ async def worker_transport(session: Worker) -> Transport:
     """This account's connection pool, opened on first use."""
     if session.transport is None:
         session.transport = Transport(
-            session.client, reader_connections(session), transfer_connections()
+            session.client,
+            session.download_lanes or reader_connections(session),
+            session.upload_lanes or transfer_connections(),
         )
     return cast(Transport, session.transport)
 
@@ -1725,10 +1830,8 @@ async def relay_copy(
     file_id = helpers.generate_random_long()
     read_transport = await worker_transport(reader)
     send_transport = await worker_transport(uploader)
-    download = await read_transport.download_senders(dc_id)
-    upload = await send_transport.upload_senders()
-    fetchers = min(len(download), total_down) or 1
-    pushers = min(len(upload), total_up) or 1
+    fetchers = min(LANES_PER_VIDEO, total_down) or 1
+    pushers = min(LANES_PER_VIDEO, total_up) or 1
     per_download = DOWNLOAD_PART // PART_SIZE
     queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(
         maxsize=max(4, pushers * 2)
@@ -1737,13 +1840,11 @@ async def relay_copy(
     guard = asyncio.Lock()
 
     async def fetch(start: int) -> None:
-        sender = download[start]
         index = start
         while index < total_down:
             offset = index * DOWNLOAD_PART
-            fetched = await call_part(
-                reader.client,
-                sender,
+            fetched = await read_transport.fetch(
+                dc_id,
                 GetFileRequest(location, offset=offset, limit=DOWNLOAD_PART),
                 f"{reader.label} down {index}",
             )
@@ -1759,16 +1860,14 @@ async def relay_copy(
                 )
             index += fetchers
 
-    async def push(sender: Any) -> None:
+    async def push() -> None:
         nonlocal moved
         while True:
             item = await queue.get()
             if item is None:
                 return
             part, data = item
-            await call_part(
-                uploader.client,
-                sender,
+            await send_transport.push(
                 SaveBigFilePartRequest(
                     file_id=file_id,
                     file_part=part,
@@ -1782,7 +1881,7 @@ async def relay_copy(
                 progress(moved)
 
     fetch_tasks = [asyncio.create_task(fetch(index)) for index in range(fetchers)]
-    push_tasks = [asyncio.create_task(push(upload[index])) for index in range(pushers)]
+    push_tasks = [asyncio.create_task(push()) for _ in range(pushers)]
     try:
         await asyncio.gather(*fetch_tasks)
         # Every byte is queued, so release the pushers once they have drained it.
@@ -1813,8 +1912,7 @@ async def pooled_download(
     # 1 MiB is Telegram's ceiling for one part, so this is half the round trips
     # of a 512 KiB read.
     total_parts = math.ceil(size / DOWNLOAD_PART)
-    senders = await transport.download_senders(dc_id)
-    lanes = min(len(senders), total_parts) or 1
+    lanes = min(LANES_PER_VIDEO, total_parts) or 1
     handle = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.ftruncate(handle, size)
     done = 0
@@ -1822,13 +1920,11 @@ async def pooled_download(
 
     async def pipeline(start: int) -> None:
         nonlocal done
-        sender = senders[start]
         part = start
         while part < total_parts:
             offset = part * DOWNLOAD_PART
-            fetched = await call_part(
-                transport.client,
-                sender,
+            fetched = await transport.fetch(
+                dc_id,
                 GetFileRequest(location, offset=offset, limit=DOWNLOAD_PART),
                 f"download part {part}",
             )
@@ -1861,24 +1957,20 @@ async def pooled_upload(
             f"{MAX_UPLOAD_PARTS} limit."
         )
     file_id = helpers.generate_random_long()
-    senders = await transport.upload_senders()
-    lanes = min(len(senders), total_parts) or 1
+    lanes = min(LANES_PER_VIDEO, total_parts) or 1
     handle = os.open(file_path, os.O_RDONLY)
     done = 0
     guard = asyncio.Lock()
 
     async def pipeline(start: int) -> None:
         nonlocal done
-        sender = senders[start]
         part = start
         while part < total_parts:
             offset = part * PART_SIZE
             chunk = os.pread(handle, PART_SIZE, offset)
             if not chunk:
                 break
-            await call_part(
-                transport.client,
-                sender,
+            await transport.push(
                 SaveBigFilePartRequest(
                     file_id=file_id,
                     file_part=part,
@@ -2758,6 +2850,7 @@ async def run_group(
             dashboard.retotal()
             continue
 
+        allocate_lanes(reader, [worker for worker, _dest in ready])
         relays: list[Relay] = []
         for worker, dest_peer in ready:
             for slot in range(slots):
@@ -2785,8 +2878,9 @@ async def run_group(
             f"{', '.join(sorted({w.label for w, _d in ready}))}[/dim]"
         )
         console.print(
-            f"[dim]{reader_connections(reader)} download lane(s) · "
-            f"{transfer_connections()} upload lane(s) per account[/dim]"
+            f"[dim]{reader.download_lanes} download socket(s) on "
+            f"{reader.label} · {ready[0][0].upload_lanes} upload socket(s) per "
+            f"uploader · {connection_budget()} total budget[/dim]"
         )
         pointer = PointerState(
             allowed=not bool(getattr(plan.source, "noforwards", False))
@@ -3059,6 +3153,12 @@ def show_report(
             padding=(1, 3),
         )
     )
+    if CONNECTION_NOISE.count:
+        console.print(
+            f"[dim]{CONNECTION_NOISE.count} dropped connection(s) absorbed and "
+            f"retried. A large number means the socket budget is too high for "
+            f"this host; lower FINAL_TOTAL_CONNECTIONS.[/dim]"
+        )
     if deferred:
         console.print(
             f"[yellow]{deferred} oversized video(s) were left; rerun and choose "
@@ -3086,6 +3186,7 @@ def show_report(
 async def run() -> bool:
     banner()
     _silence_shutdown_noise()
+    quiet_connection_noise()
     started = time.monotonic()
     pool: list[Worker] = []
     try:
