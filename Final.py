@@ -167,7 +167,14 @@ THUMB_WIDTH = 320
 DEFAULT_CONNECTIONS = 4
 MAX_CONNECTIONS = 16
 # Upload sockets per account when the budget allows it.
-MAX_UPLOAD_LANES = 6
+MAX_UPLOAD_LANES = 5
+# Download sockets for an ordinary account reading its own source. Telegram
+# meters it per account, so a couple reaches that ceiling and more only takes
+# budget away from an unmetered Premium reader.
+METERED_READER_LANES = 2
+# An unmetered reader keeps at least this many, so adding self-reading accounts
+# never starves the one account whose throughput actually keeps scaling.
+PREMIUM_READER_FLOOR = 8
 # Telegram Premium removes the download speed limit, so the reading account can
 # take far more download lanes than an ordinary one. Uploads stay modest per
 # account because that allowance is still metered — the way to upload faster is
@@ -178,10 +185,10 @@ DEFAULT_PREMIUM_READER_CONNECTIONS = 16
 # this many, Telegram starts resetting connections instead of serving them, and
 # each reset costs a retried part, so a bigger number transfers less. Divided
 # between the reader and the uploaders at roster time.
-DEFAULT_CONNECTION_BUDGET = 32
+DEFAULT_CONNECTION_BUDGET = 64
 # In-flight requests per video, per direction. The pool is what actually bounds
 # concurrency; this only decides how many tasks queue for it.
-LANES_PER_VIDEO = 4
+LANES_PER_VIDEO = 8
 # Requests allowed in flight on one socket. Two lets the next request be on the
 # wire while the previous reply is still coming back, which hides the round trip
 # without needing another connection.
@@ -1680,10 +1687,30 @@ def allocate_lanes(
     for session in uploaders:
         session.upload_lanes = per_upload
     left = max(4, budget - per_upload * upload_count)
-    download_count = max(1, len(downloaders))
-    per_download = max(2, left // download_count)
-    for session in downloaders:
-        session.download_lanes = min(reader_connections(session), per_download)
+    # Splitting the download sockets evenly would be pointless: the gain from a
+    # second reader is its own server-side allowance, not more sockets, and an
+    # ordinary account reaches its allowance on very few. So a metered reader
+    # gets just enough to use its own quota and the unmetered Premium one keeps
+    # the remainder, since that is the account whose throughput keeps scaling.
+    metered = [session for session in downloaders if not session.premium]
+    unmetered = [session for session in downloaders if session.premium]
+    for session in metered:
+        session.download_lanes = min(
+            reader_connections(session), METERED_READER_LANES
+        )
+    if unmetered:
+        spare = left - METERED_READER_LANES * len(metered)
+        for session in unmetered:
+            session.download_lanes = min(
+                reader_connections(session),
+                max(PREMIUM_READER_FLOOR, spare // len(unmetered)),
+            )
+    elif metered:
+        # No Premium account: share what is left between the metered readers.
+        for session in metered:
+            session.download_lanes = min(
+                reader_connections(session), max(2, left // len(metered))
+            )
 
 
 def reader_connections(session: Worker) -> int:
@@ -3041,22 +3068,21 @@ async def run_group(
             dashboard.retotal()
             continue
 
-        # Routing every download through one account caps all the uploaders at
-        # that one account's download allowance. Telegram does not meter a
-        # Premium account, so funnelling through one is a clear win; without
-        # Premium it is a bottleneck, and any account that can reach the source
-        # is better off fetching its own videos in parallel. Doing so also
-        # re-enables the free pointer copy for that account.
+        # Every account that can reach the source should fetch its own videos,
+        # Premium reader or not. A Premium account is unmetered, but it is still
+        # one account and one set of sockets, so it was the ceiling for the
+        # whole group; an account reading for itself adds download capacity on
+        # top of it instead of queueing behind it. Only the accounts that
+        # genuinely cannot get into the source are relayed through the reader.
         own_source: dict[int, Any] = {reader.user_id: reader_source}
-        if not reader.premium:
-            for worker, _dest in ready:
-                if worker.user_id in own_source:
-                    continue
-                peer = await worker_source_peer(
-                    owner, worker, plan.source, entry_link, probe_ids
-                )
-                if peer is not None:
-                    own_source[worker.user_id] = peer
+        for worker, _dest in ready:
+            if worker.user_id in own_source:
+                continue
+            peer = await worker_source_peer(
+                owner, worker, plan.source, entry_link, probe_ids
+            )
+            if peer is not None:
+                own_source[worker.user_id] = peer
 
         uploading = [worker for worker, _dest in ready]
         downloading = [
@@ -3098,26 +3124,21 @@ async def run_group(
             f"[dim]{escape(plan.title)} · {len(plan.pending)} video(s) · "
             f"uploading via {', '.join(sorted(w.label for w in uploading))}[/dim]"
         )
-        if reader.premium:
-            console.print(
-                f"[dim]fetching via {reader.label} (premium, unmetered) for "
-                f"all {len(uploading)} uploader(s)[/dim]"
+        detail = f"{len(own)} account(s) fetch their own"
+        if relayed:
+            badge = " (premium)" if reader.premium else ""
+            detail += (
+                f" · {len(relayed)} relayed via {reader.label}{badge} "
+                f"(no source access)"
             )
-        else:
-            detail = f"{len(own)} account(s) fetch their own"
-            if relayed:
-                detail += (
-                    f" · {len(relayed)} relayed via {reader.label} "
-                    f"(no source access)"
-                )
-            console.print(f"[dim]{detail}[/dim]")
-            if len(own) < 2:
-                console.print(
-                    f"[yellow]Only {reader.label} can read this source and it "
-                    f"is not Premium, so its download cap limits every "
-                    f"uploader. Premium on {reader.label}, or getting the "
-                    f"workers into the source, is what lifts this.[/yellow]"
-                )
+        console.print(f"[dim]{detail}[/dim]")
+        if len(own) < 2 and relayed:
+            console.print(
+                f"[yellow]Only {reader.label} can read this source, so its "
+                f"download rate caps every uploader. Getting the workers into "
+                f"the source is what lifts this — the owner needs the right to "
+                f"add members there.[/yellow]"
+            )
         console.print(
             f"[dim]{sum(w.download_lanes for w in downloading)} download + "
             f"{sum(w.upload_lanes for w in uploading)} upload socket(s) of "
