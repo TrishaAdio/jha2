@@ -75,12 +75,19 @@ from rich.table import Table
 from rich.text import Text
 from telethon import TelegramClient, types, utils
 from telethon.errors import (
+    ChatAdminRequiredError,
     ChatForwardsRestrictedError,
     FileReferenceExpiredError,
     FloodWaitError,
     MediaEmptyError,
+    PeerFloodError,
     RPCError,
     UserAlreadyParticipantError,
+    UserBannedInChannelError,
+    UserChannelsTooMuchError,
+    UserKickedError,
+    UserNotMutualContactError,
+    UserPrivacyRestrictedError,
 )
 from telethon.tl.functions import channels, chatlists, messages
 
@@ -112,6 +119,7 @@ from telegram_folder_backup import (
     parse_invite_hash,
     parse_target_list,
     print_named_link,
+    resolve_worker_user,
     rpc_call,
     to_peer,
     video_size,
@@ -266,6 +274,7 @@ class Worker(Session):
     failed: int = 0
     anonymous: bool = False
     last_error: str = ""
+    username: str = ""
 
 
 def banner() -> None:
@@ -308,6 +317,7 @@ async def authenticate() -> tuple[list[Worker], int, str]:
             label="owner",
             user_id=int(owner_me.id),
             name=utils.get_display_name(owner_me) or "",
+            username=getattr(owner_me, "username", None) or "",
         )
     ]
 
@@ -346,6 +356,7 @@ async def authenticate() -> tuple[list[Worker], int, str]:
                 label=f"w{number}",
                 user_id=int(me.id),
                 name=utils.get_display_name(me) or "",
+                username=getattr(me, "username", None) or "",
             )
         )
 
@@ -1140,57 +1151,230 @@ async def source_entry_link(
     return link if isinstance(link, str) and link else None
 
 
-async def worker_source_peer(
-    worker: Worker,
-    source: types.Chat | types.Channel,
-    entry_link: str | None,
-) -> Any | None:
-    """Resolve the worker's own handle on a source, joining it if necessary.
+def _short(error: BaseException) -> str:
+    """One-line reason for the console, without Telethon's request dump."""
+    text = str(error).strip().splitlines()[0] if str(error).strip() else ""
+    return f"{type(error).__name__}: {text}"[:110]
 
-    Access hashes are per-account, so the owner's handle is useless to a
-    worker: each one has to resolve the source itself. A worker that cannot
-    get in simply sits out this source rather than failing the run.
+
+async def can_read_source(
+    client: TelegramClient, peer: Any, probe_ids: Sequence[int]
+) -> bool:
+    """True if this account can actually fetch history from the source.
+
+    Having the chat in the session cache or being listed as a member is not
+    enough: a private group can hide older history from newly added members, and
+    a worker that cannot see a video would fetch ``None`` and the run would
+    mistake it for a deleted message. Several ids are tried because any single
+    one may genuinely have been deleted since the scan.
+    """
+    for message_id in probe_ids[:3]:
+        try:
+            if await client.get_messages(peer, ids=message_id) is not None:
+                return True
+        except (RPCError, ValueError, TypeError):
+            return False
+    return False
+
+
+async def resolve_worker_user_for_owner(
+    owner: Worker, worker: Worker, source: types.Chat | types.Channel
+) -> Any | None:
+    """InputUser the owner can act on, via cache, source search, then @username."""
+    user = await resolve_worker_user(owner.client, worker, source)
+    if user is not None:
+        return user
+    if worker.username:
+        try:
+            return cast(
+                Any,
+                utils.get_input_user(
+                    await owner.client.get_input_entity(worker.username)
+                ),
+            )
+        except (RPCError, ValueError, TypeError):
+            return None
+    return None
+
+
+async def owner_adds_worker(
+    owner: Worker, worker: Worker, source: types.Chat | types.Channel
+) -> str | None:
+    """Add a worker to the source with the owner's "add member" right.
+
+    Returns ``None`` on success, otherwise the reason it did not work. Telegram
+    reports a user who blocks being added in ``missing_invitees`` instead of
+    raising, so that field is checked; trusting the absence of an exception
+    would report success for an add that silently did nothing.
+    """
+    user = await resolve_worker_user_for_owner(owner, worker, source)
+    if user is None:
+        return "owner cannot resolve this worker (no shared chat or @username)"
+    try:
+        if isinstance(source, types.Channel):
+            channel = cast(Any, utils.get_input_channel(source))
+            invited = cast(
+                Any,
+                await rpc_call(
+                    f"owner adds {worker.label}",
+                    lambda: owner.client(
+                        channels.InviteToChannelRequest(
+                            channel=channel, users=[user]
+                        )
+                    ),
+                    retry_server_errors=False,
+                ),
+            )
+            if getattr(invited, "missing_invitees", None):
+                return "worker's privacy settings block being added"
+        else:
+            await rpc_call(
+                f"owner adds {worker.label}",
+                lambda: owner.client(
+                    messages.AddChatUserRequest(
+                        chat_id=source.id, user_id=user, fwd_limit=100
+                    )
+                ),
+                retry_server_errors=False,
+            )
+    except UserAlreadyParticipantError:
+        return None
+    except UserPrivacyRestrictedError:
+        return "worker's privacy settings block being added"
+    except UserNotMutualContactError:
+        return "worker must be a mutual contact of the owner to be added"
+    except ChatAdminRequiredError:
+        return "owner is not allowed to add members to this source"
+    except UserBannedInChannelError:
+        return "worker is banned from this source"
+    except UserKickedError:
+        return "worker was removed from this source and cannot be re-added"
+    except UserChannelsTooMuchError:
+        return "worker is already in too many groups and channels"
+    except PeerFloodError:
+        return "owner is limited by Telegram from adding members right now"
+    except (FloodWaitError, FloodTooLongError) as error:
+        seconds = int(getattr(error, "seconds", 0))
+        return f"owner's add-member is rate-limited ({seconds}s)"
+    except (RPCError, RuntimeError, ValueError, TypeError) as error:
+        return _short(error)
+    return None
+
+
+async def worker_peer_after_add(
+    worker: Worker, source: types.Chat | types.Channel
+) -> Any | None:
+    """Find the worker's own handle on a source it was just added to.
+
+    A freshly added account has no access hash for the chat in its session, so
+    it is resolved by @username when there is one, otherwise by reading the
+    newest dialogs, where the "you were added" service message puts the chat.
     """
     try:
         return await worker.client.get_input_entity(to_peer(source))
     except (RPCError, ValueError, TypeError):
         pass
-    if not entry_link:
-        return None
-
-    await pace_joins()
+    username = getattr(source, "username", None)
+    if username:
+        try:
+            return await worker.client.get_input_entity(username)
+        except (RPCError, ValueError, TypeError):
+            pass
+    wanted = utils.get_peer_id(source)
     try:
-        if "/+" in entry_link or "/joinchat/" in entry_link:
-            await worker.client(
-                messages.ImportChatInviteRequest(parse_invite_hash(entry_link))
-            )
-        else:
-            username = entry_link.rstrip("/").rsplit("/", 1)[-1]
-            entity = await worker.client.get_entity(username)
-            if isinstance(entity, types.Channel):
-                await worker.client(
-                    channels.JoinChannelRequest(
-                        cast(Any, utils.get_input_channel(entity))
-                    )
-                )
-    except UserAlreadyParticipantError:
-        pass
-    except FloodWaitError as error:
-        worker.last_error = f"source join rate-limited {int(error.seconds)}s"
-        console.print(
-            f"[yellow]{worker.label} cannot join "
-            f"'{escape(utils.get_display_name(source) or '')}' right now "
-            f"({int(error.seconds)}s rate limit); it will sit this one out.[/yellow]"
-        )
-        return None
-    except (RPCError, RuntimeError, ValueError, TypeError) as error:
-        worker.last_error = f"source join: {error}"
-        return None
-
-    try:
-        return await worker.client.get_input_entity(to_peer(source))
+        async for dialog in worker.client.iter_dialogs(limit=100):
+            if utils.get_peer_id(dialog.entity) == wanted:
+                return await worker.client.get_input_entity(dialog.entity)
     except (RPCError, ValueError, TypeError):
-        return None
+        pass
+    return None
+
+
+async def worker_source_peer(
+    owner: Worker,
+    worker: Worker,
+    source: types.Chat | types.Channel,
+    entry_link: str | None,
+    probe_ids: Sequence[int],
+) -> Any | None:
+    """Get a worker reading the source, trying the cheapest route first.
+
+    1. It may already have access (verified by actually reading a video).
+    2. It joins itself through the link.
+    3. If that fails, the owner adds it with the "add member" option.
+
+    Every failure is printed with its reason, so a worker that sits a source out
+    is never a silent surprise. Access hashes are per-account, so the owner's
+    handle is useless to a worker and each one resolves the source itself.
+    """
+    name = escape(utils.get_display_name(source) or "source")
+
+    try:
+        existing = await worker.client.get_input_entity(to_peer(source))
+    except (RPCError, ValueError, TypeError):
+        existing = None
+    if existing is not None and await can_read_source(
+        worker.client, existing, probe_ids
+    ):
+        return existing
+
+    join_reason = "no link available to join with"
+    if entry_link:
+        await pace_joins()
+        try:
+            if "/+" in entry_link or "/joinchat/" in entry_link:
+                await worker.client(
+                    messages.ImportChatInviteRequest(parse_invite_hash(entry_link))
+                )
+            else:
+                username = entry_link.rstrip("/").rsplit("/", 1)[-1]
+                entity = await worker.client.get_entity(username)
+                if isinstance(entity, types.Channel):
+                    await worker.client(
+                        channels.JoinChannelRequest(
+                            cast(Any, utils.get_input_channel(entity))
+                        )
+                    )
+            join_reason = ""
+        except UserAlreadyParticipantError:
+            join_reason = ""
+        except FloodWaitError as error:
+            join_reason = f"join rate-limited ({int(error.seconds)}s)"
+        except (RPCError, RuntimeError, ValueError, TypeError) as error:
+            join_reason = _short(error)
+
+        if not join_reason:
+            peer = await worker_peer_after_add(worker, source)
+            if peer is not None and await can_read_source(
+                worker.client, peer, probe_ids
+            ):
+                return peer
+            join_reason = "joined but cannot read the history"
+
+    console.print(
+        f"[yellow]{worker.label} could not join '{name}' itself "
+        f"({escape(join_reason)}); {owner.label} will add it as a member.[/yellow]"
+    )
+    reason = await owner_adds_worker(owner, worker, source)
+    if reason is None:
+        peer = await worker_peer_after_add(worker, source)
+        if peer is not None and await can_read_source(
+            worker.client, peer, probe_ids
+        ):
+            console.print(
+                f"[green]{owner.label} added {worker.label} to '{name}'[/green]"
+            )
+            return peer
+        reason = (
+            "added, but it cannot read the history "
+            "(is history hidden from new members?)"
+        )
+
+    worker.last_error = f"source: {reason}"[:120]
+    console.print(
+        f"[yellow]{worker.label} sits out '{name}': {escape(reason)}[/yellow]"
+    )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1776,13 +1960,25 @@ async def run_group(
             entry_link = await source_entry_link(owner.client, plan.source)
         for worker in pool[1:]:
             # A worker has to reach both ends: read the source and post here.
-            source_peer = await worker_source_peer(worker, plan.source, entry_link)
+            source_peer = await worker_source_peer(
+                owner,
+                worker,
+                plan.source,
+                entry_link,
+                [message_id for message_id, _size in plan.pending],
+            )
             if source_peer is None:
                 continue
             dest_peer = await attach_worker_to_group(
                 cast(Any, inviters), worker, primary, channel_id, result.invite_link
             )
             if dest_peer is None:
+                worker.last_error = "could not be added to the backup group"
+                console.print(
+                    f"[yellow]{worker.label} could not be added to "
+                    f"{escape(result.title)} (owner invite and self-join both "
+                    f"failed); it sits this group out.[/yellow]"
+                )
                 continue
             # Anonymity is not optional: a worker that could not be promoted
             # would be credited by name and user id on every video it sent, so
