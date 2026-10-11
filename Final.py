@@ -1623,23 +1623,27 @@ def connection_budget() -> int:
     return DEFAULT_CONNECTION_BUDGET
 
 
-def allocate_lanes(reader: Worker, uploaders: Sequence[Worker]) -> None:
-    """Split the socket budget between the reader and the uploading accounts.
+def allocate_lanes(
+    downloaders: Sequence[Worker], uploaders: Sequence[Worker]
+) -> None:
+    """Split the socket budget across the accounts that will actually use it.
 
     Opening sockets per account without regard to how many accounts there are
     is what produced the connection resets: eight accounts at the old defaults
     asked for 44 at once. Uploads are metered per account, so a couple of lanes
-    each is already near that account's ceiling and the rest of the budget is
-    better spent on the reader, whose Premium download is not metered.
+    each is already near that account's ceiling; the rest goes to whichever
+    accounts are downloading, shared out between them.
     """
     budget = connection_budget()
-    count = max(1, len(uploaders))
-    per_upload = max(2, min(transfer_connections(), (budget // 2) // count))
+    upload_count = max(1, len(uploaders))
+    per_upload = max(2, min(transfer_connections(), (budget // 2) // upload_count))
     for session in uploaders:
         session.upload_lanes = per_upload
-    reader.download_lanes = max(
-        4, min(reader_connections(reader), budget - per_upload * count)
-    )
+    left = max(4, budget - per_upload * upload_count)
+    download_count = max(1, len(downloaders))
+    per_download = max(2, left // download_count)
+    for session in downloaders:
+        session.download_lanes = min(reader_connections(session), per_download)
 
 
 def reader_connections(session: Worker) -> int:
@@ -2850,20 +2854,51 @@ async def run_group(
             dashboard.retotal()
             continue
 
-        allocate_lanes(reader, [worker for worker, _dest in ready])
+        # Routing every download through one account caps all the uploaders at
+        # that one account's download allowance. Telegram does not meter a
+        # Premium account, so funnelling through one is a clear win; without
+        # Premium it is a bottleneck, and any account that can reach the source
+        # is better off fetching its own videos in parallel. Doing so also
+        # re-enables the free pointer copy for that account.
+        own_source: dict[int, Any] = {reader.user_id: reader_source}
+        if not reader.premium:
+            for worker, _dest in ready:
+                if worker.user_id in own_source:
+                    continue
+                peer = await worker_source_peer(
+                    owner, worker, plan.source, entry_link, probe_ids
+                )
+                if peer is not None:
+                    own_source[worker.user_id] = peer
+
+        uploading = [worker for worker, _dest in ready]
+        downloading = [
+            worker for worker in uploading if worker.user_id in own_source
+        ]
+        relayed = [
+            worker for worker in uploading if worker.user_id not in own_source
+        ]
+        if relayed and reader.user_id not in {w.user_id for w in downloading}:
+            downloading.append(reader)
+        allocate_lanes(downloading, uploading)
+
         relays: list[Relay] = []
         for worker, dest_peer in ready:
+            source_peer = own_source.get(worker.user_id)
+            relay_reader = worker if source_peer is not None else reader
             for slot in range(slots):
                 label = worker.label if slots == 1 else f"{worker.label}.{slot + 1}"
                 relays.append(
                     Relay(
-                        reader=reader,
+                        reader=relay_reader,
                         uploader=worker,
-                        source_peer=reader_source,
+                        source_peer=source_peer
+                        if source_peer is not None
+                        else reader_source,
                         dest_peer=dest_peer,
                         lane=dashboard.lane(
                             label
-                            if reader.user_id == worker.user_id
+                            if relay_reader.user_id == worker.user_id
                             else f"{reader.label}→{label}"
                         ),
                     )
@@ -2871,16 +2906,35 @@ async def run_group(
         result.posters = sorted(
             {*result.posters, *(relay.uploader.label for relay in relays)}
         )
-        badge = " (premium, unmetered)" if reader.premium else ""
+        own = [w.label for w in uploading if w.user_id in own_source]
         console.print(
             f"[dim]{escape(plan.title)} · {len(plan.pending)} video(s) · "
-            f"reading via {reader.label}{badge} · uploading via "
-            f"{', '.join(sorted({w.label for w, _d in ready}))}[/dim]"
+            f"uploading via {', '.join(sorted(w.label for w in uploading))}[/dim]"
         )
+        if reader.premium:
+            console.print(
+                f"[dim]fetching via {reader.label} (premium, unmetered) for "
+                f"all {len(uploading)} uploader(s)[/dim]"
+            )
+        else:
+            detail = f"{len(own)} account(s) fetch their own"
+            if relayed:
+                detail += (
+                    f" · {len(relayed)} relayed via {reader.label} "
+                    f"(no source access)"
+                )
+            console.print(f"[dim]{detail}[/dim]")
+            if len(own) < 2:
+                console.print(
+                    f"[yellow]Only {reader.label} can read this source and it "
+                    f"is not Premium, so its download cap limits every "
+                    f"uploader. Premium on {reader.label}, or getting the "
+                    f"workers into the source, is what lifts this.[/yellow]"
+                )
         console.print(
-            f"[dim]{reader.download_lanes} download socket(s) on "
-            f"{reader.label} · {ready[0][0].upload_lanes} upload socket(s) per "
-            f"uploader · {connection_budget()} total budget[/dim]"
+            f"[dim]{sum(w.download_lanes for w in downloading)} download + "
+            f"{sum(w.upload_lanes for w in uploading)} upload socket(s) of "
+            f"{connection_budget()} budget[/dim]"
         )
         pointer = PointerState(
             allowed=not bool(getattr(plan.source, "noforwards", False))
