@@ -77,6 +77,7 @@ from telethon import TelegramClient, types, utils
 from telethon.errors import (
     ChatAdminRequiredError,
     ChatForwardsRestrictedError,
+    ChatNotModifiedError,
     FileReferenceExpiredError,
     FloodWaitError,
     MediaEmptyError,
@@ -89,7 +90,7 @@ from telethon.errors import (
     UserNotMutualContactError,
     UserPrivacyRestrictedError,
 )
-from telethon.tl.functions import channels, chatlists, messages
+from telethon.tl.functions import channels, chatlists, contacts, messages
 
 from telegram_folder_backup import (
     HEART,
@@ -275,6 +276,7 @@ class Worker(Session):
     anonymous: bool = False
     last_error: str = ""
     username: str = ""
+    phone: str = ""
 
 
 def banner() -> None:
@@ -318,6 +320,7 @@ async def authenticate() -> tuple[list[Worker], int, str]:
             user_id=int(owner_me.id),
             name=utils.get_display_name(owner_me) or "",
             username=getattr(owner_me, "username", None) or "",
+            phone=getattr(owner_me, "phone", None) or "",
         )
     ]
 
@@ -357,11 +360,86 @@ async def authenticate() -> tuple[list[Worker], int, str]:
                 user_id=int(me.id),
                 name=utils.get_display_name(me) or "",
                 username=getattr(me, "username", None) or "",
+                phone=getattr(me, "phone", None) or "",
             )
         )
 
+    await introduce_accounts(pool)
     show_accounts(pool)
     return pool, api_id, api_hash
+
+
+async def import_contacts(
+    client: TelegramClient, targets: Sequence[Worker]
+) -> set[int]:
+    """Save accounts as contacts so ``client`` can address them by user id.
+
+    Telegram only lets an account act on a user it has already met, because the
+    access hash needed to name a user is different for every account. Two
+    accounts that never shared a chat therefore cannot refer to each other, so
+    the owner could not add a worker as a member. Saving the number as a
+    contact introduces them. Returns the user ids Telegram matched.
+    """
+    entries = [
+        types.InputPhoneContact(
+            client_id=target.user_id,
+            phone="+" + target.phone.lstrip("+"),
+            first_name=f"Final {target.label}",
+            last_name="",
+        )
+        for target in targets
+        if target.phone
+    ]
+    if not entries:
+        return set()
+    try:
+        imported = cast(
+            Any,
+            await rpc_call(
+                "save accounts as contacts",
+                lambda: client(contacts.ImportContactsRequest(entries)),
+                retry_server_errors=False,
+            ),
+        )
+    except (RPCError, RuntimeError, ValueError, TypeError) as error:
+        console.print(
+            f"[yellow]Could not save accounts as contacts: "
+            f"{escape(str(error))}[/yellow]"
+        )
+        return set()
+    return {int(user.id) for user in getattr(imported, "users", None) or []}
+
+
+async def introduce_accounts(pool: Sequence[Worker]) -> None:
+    """Make the owner and every worker known to each other, once, at login.
+
+    The owner saves each worker (needed so it can add them as members), and each
+    worker saves the owner (so they are mutual contacts, which some privacy
+    settings require before someone may be added to a group). These are the
+    user's own accounts; the contact entries are named ``Final <label>``.
+    """
+    if len(pool) < 2:
+        return
+    owner, workers = pool[0], list(pool[1:])
+    missing = [w.label for w in workers if not w.phone]
+    if missing:
+        console.print(
+            f"[yellow]No phone number known for {', '.join(missing)}; the owner "
+            f"cannot add those as members unless they share a chat.[/yellow]"
+        )
+    matched = await import_contacts(owner.client, workers)
+    for worker in workers:
+        if worker.phone and worker.user_id not in matched:
+            console.print(
+                f"[yellow]Telegram did not match {worker.label}'s number, so the "
+                f"owner may not be able to add it as a member.[/yellow]"
+            )
+    for worker in workers:
+        await import_contacts(worker.client, [owner])
+    console.print(
+        f"[dim]{len(matched)}/{len(workers)} worker(s) saved as contacts of the "
+        f"owner[/dim]"
+    )
 
 
 def show_accounts(pool: Sequence[Worker]) -> None:
@@ -958,6 +1036,10 @@ async def apply_member_rights(
             retry_server_errors=False,
         )
         return True
+    except ChatNotModifiedError:
+        # Telegram says this when the rights are already what was asked for,
+        # which is the normal case for a reused group. That is success.
+        return True
     except (RPCError, RuntimeError, ValueError, TypeError) as error:
         console.print(f"[yellow]{label} failed: {escape(str(error))}[/yellow]")
         return False
@@ -1193,6 +1275,19 @@ async def resolve_worker_user_for_owner(
                 ),
             )
         except (RPCError, ValueError, TypeError):
+            pass
+    # Last resort: save the worker's number as a contact, which introduces it.
+    if worker.phone and worker.user_id in await import_contacts(
+        owner.client, [worker]
+    ):
+        try:
+            return cast(
+                Any,
+                utils.get_input_user(
+                    await owner.client.get_input_entity(worker.user_id)
+                ),
+            )
+        except (RPCError, ValueError, TypeError):
             return None
     return None
 
@@ -1209,7 +1304,7 @@ async def owner_adds_worker(
     """
     user = await resolve_worker_user_for_owner(owner, worker, source)
     if user is None:
-        return "owner cannot resolve this worker (no shared chat or @username)"
+        return "owner cannot find this worker (no shared chat, @username or phone)"
     try:
         if isinstance(source, types.Channel):
             channel = cast(Any, utils.get_input_channel(source))
