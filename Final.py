@@ -623,7 +623,7 @@ class FinalState:
         max_id: int,
         normal: dict[int, int],
         big: dict[int, int],
-        huge: int,
+        oversize: dict[int, int],
     ) -> None:
         async with self._lock:
             self.scans[source_key] = {
@@ -631,7 +631,9 @@ class FinalState:
                 "max_id": int(max_id),
                 "normal": {str(mid): int(size) for mid, size in normal.items()},
                 "big": {str(mid): int(size) for mid, size in big.items()},
-                "huge": int(huge),
+                "oversize": {
+                    str(mid): int(size) for mid, size in oversize.items()
+                },
             }
             self.save()
 
@@ -1006,11 +1008,25 @@ class Plan:
     pending: list[tuple[int, int]] = field(default_factory=list)
     # Over the normal size limit, held back for the optional second pass.
     big: list[tuple[int, int]] = field(default_factory=list)
+    # Past even the "high" limit, so re-uploading them is not possible. They
+    # are still kept, because forwarding has no size limit and can take them.
+    oversize: list[tuple[int, int]] = field(default_factory=list)
     already: int = 0
-    # Past even the "high" limit, so Telegram cannot take them at all.
-    huge: int = 0
     cached: bool = False
     error: str | None = None
+
+    @property
+    def huge(self) -> int:
+        return len(self.oversize)
+
+    @property
+    def everything(self) -> list[tuple[int, int]]:
+        """Every outstanding video, whatever its size.
+
+        Only meaningful for forwarding: it moves no bytes, so a 2 GB video is
+        no more expensive than a small one and nothing needs holding back.
+        """
+        return sorted({*self.pending, *self.big, *self.oversize})
 
     @property
     def pending_bytes(self) -> int:
@@ -1048,7 +1064,9 @@ async def build_plan(
     big: dict[int, int] = {
         int(mid): int(size) for mid, size in (record.get("big") or {}).items()
     }
-    huge = int(record.get("huge") or 0)
+    oversize: dict[int, int] = {
+        int(mid): int(size) for mid, size in (record.get("oversize") or {}).items()
+    }
     last_id = int(record.get("max_id") or 0)
     plan.cached = bool(record)
 
@@ -1062,11 +1080,15 @@ async def build_plan(
                 highest = max(highest, int(message.id))
                 if not getattr(message, "video", None):
                     continue
-                if message.id in normal or message.id in big:
+                if (
+                    message.id in normal
+                    or message.id in big
+                    or message.id in oversize
+                ):
                     continue
                 size = video_size(message)
                 if size > HIGH_VIDEO_BYTES:
-                    huge += 1
+                    oversize[message.id] = size
                 elif size > MAX_VIDEO_BYTES:
                     big[message.id] = size
                 else:
@@ -1085,14 +1107,16 @@ async def build_plan(
         highest if complete else last_id,
         normal,
         big,
-        huge,
+        oversize,
     )
 
     plan.pending = sorted(
         (mid, size) for mid, size in normal.items() if mid not in copied
     )
     plan.big = sorted((mid, size) for mid, size in big.items() if mid not in copied)
-    plan.huge = huge
+    plan.oversize = sorted(
+        (mid, size) for mid, size in oversize.items() if mid not in copied
+    )
     return plan
 
 
@@ -2743,11 +2767,19 @@ async def forward_all(
     no ``video ~ 💗 id`` marker and the caption scan cannot recover them. The
     state file is what makes a rerun resume, and it is written per batch.
     """
-    pending = list(plan.pending)
+    # Forwarding is size-blind, so the videos held back from the byte path go
+    # in the same pass rather than waiting for the "high" question.
+    pending = plan.everything
     if not pending:
         return True
     sizes = dict(pending)
     ids = [message_id for message_id, _size in pending]
+    # The oversized videos are not in the run's estimate, because until the
+    # probe succeeds we do not know they can be moved. They are added once the
+    # first batch proves forwarding works, never before.
+    queued = {message_id for message_id, _size in plan.pending}
+    extra = [item for item in pending if item[0] not in queued]
+    counted = False
     task = dashboard.lane(f"{reader.label} forward")
     dashboard.transfer.reset(
         task, description=f"{reader.label} forwarding", total=len(ids), start=True
@@ -2781,6 +2813,11 @@ async def forward_all(
                     # fall back to re-uploading without any double-send.
                     return False
                 raise
+            if not counted:
+                counted = True
+                if extra:
+                    eta.plan(size for _id, size in extra)
+                    dashboard.retotal()
             landed = (
                 sum(1 for message in sent if message is not None)
                 if isinstance(sent, (list, tuple))
@@ -3108,10 +3145,21 @@ async def run_group(
                     dashboard,
                     result,
                 ):
+                    held = len(plan.big) + len(plan.oversize)
                     console.print(
                         f"[green]{escape(plan.title)} allows forwarding — "
                         f"copied with no bytes moved.[/green]"
                     )
+                    if held:
+                        console.print(
+                            f"[green]{held} oversized video(s) went too, since "
+                            f"forwarding ignores size.[/green]"
+                        )
+                    # Nothing is outstanding for this source any more.
+                    plan.pending = []
+                    plan.big = []
+                    plan.oversize = []
+                    result.deferred = 0
                     for relay in relays:
                         dashboard.transfer.remove_task(relay.lane)
                     continue
