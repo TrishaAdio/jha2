@@ -41,7 +41,6 @@ from __future__ import annotations
 import asyncio
 import getpass
 import contextlib
-import itertools
 import json
 import logging
 import math
@@ -165,6 +164,8 @@ THUMB_WIDTH = 320
 # change it, but more worker accounts is what actually scales a run.
 DEFAULT_CONNECTIONS = 4
 MAX_CONNECTIONS = 16
+# Upload sockets per account when the budget allows it.
+MAX_UPLOAD_LANES = 6
 # Telegram Premium removes the download speed limit, so the reading account can
 # take far more download lanes than an ordinary one. Uploads stay modest per
 # account because that allowance is still metered — the way to upload faster is
@@ -175,10 +176,14 @@ DEFAULT_PREMIUM_READER_CONNECTIONS = 16
 # this many, Telegram starts resetting connections instead of serving them, and
 # each reset costs a retried part, so a bigger number transfers less. Divided
 # between the reader and the uploaders at roster time.
-DEFAULT_CONNECTION_BUDGET = 28
-# In-flight requests per video, per direction. The pool-wide gate is what
-# actually bounds concurrency; this only decides how many tasks queue for it.
+DEFAULT_CONNECTION_BUDGET = 32
+# In-flight requests per video, per direction. The pool is what actually bounds
+# concurrency; this only decides how many tasks queue for it.
 LANES_PER_VIDEO = 4
+# Requests allowed in flight on one socket. Two lets the next request be on the
+# wire while the previous reply is still coming back, which hides the round trip
+# without needing another connection.
+REQUEST_DEPTH = 2
 # Videos one account copies at the same time. These share the account's
 # connections rather than adding any, so raising it makes each video slower
 # without making the run faster. One keeps the per-video ETA honest.
@@ -1636,7 +1641,11 @@ def allocate_lanes(
     """
     budget = connection_budget()
     upload_count = max(1, len(uploaders))
-    per_upload = max(2, min(transfer_connections(), (budget // 2) // upload_count))
+    # Uploads are metered per account, so they need the larger share; a Premium
+    # downloader is not metered and delivers more per socket.
+    share = 2 if any(session.premium for session in downloaders) else 1
+    upload_budget = budget * share // (share + 1)
+    per_upload = max(2, min(MAX_UPLOAD_LANES, upload_budget // upload_count))
     for session in uploaders:
         session.upload_lanes = per_upload
     left = max(4, budget - per_upload * upload_count)
@@ -1708,6 +1717,15 @@ def transfer_connections() -> int:
     return DEFAULT_CONNECTIONS
 
 
+def _sender_pool(senders: Sequence[Any]) -> asyncio.Queue[Any]:
+    """Checkout queue holding each socket ``REQUEST_DEPTH`` times."""
+    pool: asyncio.Queue[Any] = asyncio.Queue()
+    for _ in range(REQUEST_DEPTH):
+        for sender in senders:
+            pool.put_nowait(sender)
+    return pool
+
+
 class Transport:
     """One account's reusable MTProto connections.
 
@@ -1726,11 +1744,12 @@ class Transport:
         self._download: dict[int, list[Any]] = {}
         self._upload: list[Any] | None = None
         self._guard = asyncio.Lock()
-        # One permit per socket, so however many videos are in flight the pool
-        # is never asked for more requests at once than it has connections.
-        self._download_gate: dict[int, asyncio.Semaphore] = {}
-        self._upload_gate: asyncio.Semaphore | None = None
-        self._turn = itertools.count()
+        # Sockets are checked out of a queue rather than picked by a counter, so
+        # two requests in flight always hold two different sockets. A shared
+        # counter with a modulo could hand both to the same one and leave the
+        # rest idle, which silently halved upload concurrency.
+        self._download_pool: dict[int, asyncio.Queue[Any]] = {}
+        self._upload_pool: asyncio.Queue[Any] | None = None
 
     async def download_senders(self, dc_id: int) -> list[Any]:
         async with self._guard:
@@ -1740,7 +1759,7 @@ class Transport:
                     self.client, dc_id, self.download_count
                 )
                 self._download[dc_id] = senders
-                self._download_gate[dc_id] = asyncio.Semaphore(len(senders))
+                self._download_pool[dc_id] = _sender_pool(senders)
             return senders
 
     async def upload_senders(self) -> list[Any]:
@@ -1750,32 +1769,39 @@ class Transport:
                 self._upload = await open_transfer_senders(
                     self.client, own_dc, self.upload_count
                 )
-                self._upload_gate = asyncio.Semaphore(len(self._upload))
+                self._upload_pool = _sender_pool(self._upload)
             return self._upload
 
     async def fetch(self, dc_id: int, request: Any, label: str) -> Any:
-        """Run one download request on a free connection from the pool."""
-        senders = await self.download_senders(dc_id)
-        async with self._download_gate[dc_id]:
-            sender = senders[next(self._turn) % len(senders)]
+        """Run one download request on a socket checked out of the pool."""
+        await self.download_senders(dc_id)
+        pool = self._download_pool[dc_id]
+        sender = await pool.get()
+        try:
             return await call_part(self.client, sender, request, label)
+        finally:
+            pool.put_nowait(sender)
 
     async def push(self, request: Any, label: str) -> Any:
-        """Run one upload request on a free connection from the pool."""
-        senders = await self.upload_senders()
-        assert self._upload_gate is not None
-        async with self._upload_gate:
-            sender = senders[next(self._turn) % len(senders)]
+        """Run one upload request on a socket checked out of the pool."""
+        await self.upload_senders()
+        pool = self._upload_pool
+        assert pool is not None
+        sender = await pool.get()
+        try:
             return await call_part(self.client, sender, request, label)
+        finally:
+            pool.put_nowait(sender)
 
     async def close(self) -> None:
         for senders in self._download.values():
             await close_transfer_senders(senders)
         self._download.clear()
-        self._download_gate.clear()
+        self._download_pool.clear()
         if self._upload is not None:
             await close_transfer_senders(self._upload)
             self._upload = None
+        self._upload_pool = None
 
 
 async def worker_transport(session: Worker) -> Transport:
