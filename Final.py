@@ -40,8 +40,10 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import contextlib
 import json
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -51,7 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Iterable, Sequence, cast
+from typing import Any, Callable, Iterable, Sequence, cast
 
 from rich.align import Align
 from rich.console import Group as RenderGroup
@@ -73,24 +75,35 @@ from rich.progress import (
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
-from telethon import TelegramClient, types, utils
+from telethon import TelegramClient, helpers, types, utils
 from telethon.errors import (
+    AuthKeyUnregisteredError,
+    ChannelInvalidError,
+    ChannelPrivateError,
     ChatAdminRequiredError,
     ChatForwardsRestrictedError,
     ChatNotModifiedError,
     FileReferenceExpiredError,
     FloodWaitError,
+    ChatSendMediaForbiddenError,
+    ChatSendVideosForbiddenError,
+    ChatWriteForbiddenError,
     MediaEmptyError,
     PeerFloodError,
+    PeerIdInvalidError,
     RPCError,
+    SessionRevokedError,
     UserAlreadyParticipantError,
     UserBannedInChannelError,
     UserChannelsTooMuchError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
     UserKickedError,
     UserNotMutualContactError,
     UserPrivacyRestrictedError,
 )
 from telethon.tl.functions import channels, chatlists, contacts, messages
+from telethon.tl.functions.upload import GetFileRequest, SaveBigFilePartRequest
 
 from telegram_folder_backup import (
     HEART,
@@ -104,7 +117,9 @@ from telegram_folder_backup import (
     ask_links,
     attach_worker_to_group,
     brand_key,
+    call_part,
     canonical_source_name,
+    close_transfer_senders,
     console,
     disconnect_client,
     document_filename,
@@ -114,9 +129,8 @@ from telegram_folder_backup import (
     import_shared_folder,
     join_target_chat,
     login_client,
+    open_transfer_senders,
     pace_joins,
-    parallel_download,
-    parallel_upload,
     parse_invite_hash,
     parse_target_list,
     print_named_link,
@@ -142,6 +156,23 @@ THUMB_MAX_BYTES = 200 * 1024
 # Generated thumbnails are capped at this width; Telegram's own video previews
 # are 320px, and a larger one only wastes an upload.
 THUMB_WIDTH = 320
+# Connections carrying one file. Telegram throttles a single connection to
+# roughly 1 MB/s no matter how much bandwidth is free, so this is the main
+# speed dial: 8 lanes is about 8x one lane. Raise it on a fast host with
+# FINAL_CONNECTIONS; too high invites FloodWait instead of more speed.
+DEFAULT_CONNECTIONS = 8
+MAX_CONNECTIONS = 32
+# Videos one account copies at the same time. Each still uses every connection,
+# so this mainly keeps the pipe busy while one video finishes and the next
+# starts.
+DEFAULT_PARALLEL_VIDEOS = 2
+MAX_PARALLEL_VIDEOS = 8
+# A worker that keeps failing is ejected after this many consecutive errors, so
+# a broken account cannot drain the queue and fail every video in it.
+MAX_CONSECUTIVE_FAILURES = 3
+# With the "high" option, videos up to this size are copied too. 512 KiB parts
+# and Telegram's 4000-part ceiling put the hard limit at 2 GB.
+HIGH_VIDEO_BYTES = 2000 * 1024 * 1024
 # ETA accounting: one cost unit per video plus one per this many bytes. The
 # ratio only has to be in the right ballpark — the rate is measured live.
 COST_BYTES = 8 * 1024 * 1024
@@ -277,6 +308,7 @@ class Worker(Session):
     last_error: str = ""
     username: str = ""
     phone: str = ""
+    transport: Any = None
 
 
 def banner() -> None:
@@ -490,6 +522,9 @@ class FinalState:
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Could not read backup state: {error}") from error
         self.groups: dict[str, dict[str, Any]] = self.data.setdefault("groups", {})
+        # Cached video inventory per source, so a rerun does not rescan the
+        # whole history just to learn what it already knew.
+        self.scans: dict[str, dict[str, Any]] = self.data.setdefault("scans", {})
         self._lock = asyncio.Lock()
 
     def save(self) -> None:
@@ -540,6 +575,25 @@ class FinalState:
             copied.add(int(message_id))
             record["copied"] = sorted(copied)
             record["title"] = title
+            self.save()
+
+    async def save_scan(
+        self,
+        source_key: str,
+        title: str,
+        max_id: int,
+        normal: dict[int, int],
+        big: dict[int, int],
+        huge: int,
+    ) -> None:
+        async with self._lock:
+            self.scans[source_key] = {
+                "title": title,
+                "max_id": int(max_id),
+                "normal": {str(mid): int(size) for mid, size in normal.items()},
+                "big": {str(mid): int(size) for mid, size in big.items()},
+                "huge": int(huge),
+            }
             self.save()
 
     async def forget_group(self, brand: str) -> None:
@@ -633,7 +687,7 @@ class EtaColumn(ProgressColumn):
 class Dashboard:
     """One live region: an overall bar with the ETA, plus a bar per worker."""
 
-    def __init__(self, eta: Eta) -> None:
+    def __init__(self, eta: Eta, label: str = "backing up") -> None:
         self.eta = eta
         self.overall = Progress(
             SpinnerColumn(style="bright_magenta"),
@@ -656,7 +710,7 @@ class Dashboard:
             console=console,
             refresh_per_second=8,
         )
-        self.task = self.overall.add_task("backing up", total=eta.total_videos or 1)
+        self.task = self.overall.add_task(label, total=eta.total_videos or 1)
 
     def __enter__(self) -> Dashboard:
         self.live.__enter__()
@@ -911,13 +965,21 @@ class Plan:
     key: str
     brand: str
     pending: list[tuple[int, int]] = field(default_factory=list)
+    # Over the normal size limit, held back for the optional second pass.
+    big: list[tuple[int, int]] = field(default_factory=list)
     already: int = 0
-    skipped: int = 0
+    # Past even the "high" limit, so Telegram cannot take them at all.
+    huge: int = 0
+    cached: bool = False
     error: str | None = None
 
     @property
     def pending_bytes(self) -> int:
         return sum(size for _id, size in self.pending)
+
+    @property
+    def big_bytes(self) -> int:
+        return sum(size for _id, size in self.big)
 
 
 async def build_plan(
@@ -925,7 +987,14 @@ async def build_plan(
     source: types.Chat | types.Channel,
     state: FinalState,
 ) -> Plan:
-    """Server-side scan for the videos this source has not sent over yet."""
+    """Work out what is left to copy, scanning only what is new.
+
+    The first run walks the source's whole video history, which for thousands
+    of videos is slow. That result is cached, so later runs ask Telegram only
+    for messages newer than the highest id already seen and the scan finishes
+    almost immediately. The cached ids are kept separately from the copied ones,
+    so a video that is known but not yet copied is still picked up.
+    """
     title = utils.get_display_name(source) or f"Chat {utils.get_peer_id(source)}"
     key = str(utils.get_peer_id(source))
     brand = brand_key(title)
@@ -933,27 +1002,58 @@ async def build_plan(
     copied = state.copied_ids(brand, key)
     plan.already = len(copied)
 
-    found: dict[int, int] = {}
+    record = state.scans.get(key) or {}
+    normal: dict[int, int] = {
+        int(mid): int(size) for mid, size in (record.get("normal") or {}).items()
+    }
+    big: dict[int, int] = {
+        int(mid): int(size) for mid, size in (record.get("big") or {}).items()
+    }
+    huge = int(record.get("huge") or 0)
+    last_id = int(record.get("max_id") or 0)
+    plan.cached = bool(record)
+
+    highest = last_id
+    complete = True
     for media_filter in MEDIA_FILTERS:
         try:
             async for message in client.iter_messages(
-                source, reverse=True, filter=media_filter
+                source, reverse=True, filter=media_filter, min_id=last_id
             ):
-                if message.id in copied or message.id in found:
-                    continue
+                highest = max(highest, int(message.id))
                 if not getattr(message, "video", None):
                     continue
-                size = video_size(message)
-                if size > MAX_VIDEO_BYTES:
-                    plan.skipped += 1
+                if message.id in normal or message.id in big:
                     continue
-                found[message.id] = size
+                size = video_size(message)
+                if size > HIGH_VIDEO_BYTES:
+                    huge += 1
+                elif size > MAX_VIDEO_BYTES:
+                    big[message.id] = size
+                else:
+                    normal[message.id] = size
         except (RPCError, RuntimeError, ValueError) as error:
             plan.error = f"Scan failed: {error}"
+            complete = False
             console.print(f"[red]{escape(plan.title)}: {escape(plan.error)}[/red]")
             break
 
-    plan.pending = sorted(found.items())
+    # Only advance the watermark when the pass actually finished, otherwise a
+    # half-read history would be treated as fully known on the next run.
+    await state.save_scan(
+        key,
+        title,
+        highest if complete else last_id,
+        normal,
+        big,
+        huge,
+    )
+
+    plan.pending = sorted(
+        (mid, size) for mid, size in normal.items() if mid not in copied
+    )
+    plan.big = sorted((mid, size) for mid, size in big.items() if mid not in copied)
+    plan.huge = huge
     return plan
 
 
@@ -968,15 +1068,20 @@ def show_plan(plans: Sequence[Plan]) -> None:
     table.add_column("New", justify="right")
     table.add_column("Size", justify="right")
     table.add_column("Done before", justify="right")
-    table.add_column("Too big", justify="right")
+    table.add_column("Oversized", justify="right")
+    table.add_column("Scan")
     for plan in plans:
+        oversized = f"{len(plan.big)}" if plan.big else "—"
+        if plan.huge:
+            oversized = f"{oversized} (+{plan.huge} too big)"
         table.add_row(
             escape(plan.title),
             escape(group_title(plan.title)),
             str(len(plan.pending)),
             human_size(plan.pending_bytes),
             str(plan.already),
-            str(plan.skipped),
+            oversized,
+            "cached" if plan.cached else "full",
         )
     console.print(table)
 
@@ -1473,6 +1578,253 @@ async def worker_source_peer(
 
 
 # ---------------------------------------------------------------------------
+# Transfer layer
+# ---------------------------------------------------------------------------
+# Throughput on Telegram is set by how many connections carry a file, not by
+# how fast the link is: one connection tops out near ~1 MB/s however much
+# bandwidth is spare. The sibling scripts open at most 4 (one per 25 MiB), so a
+# 4 Gbps host still crawls at ~4 MB/s. Here the count is set by FINAL_CONNECTIONS
+# and the connections are opened once per account and reused for every video,
+# so no video pays for an MTProto handshake.
+
+
+def transfer_connections() -> int:
+    """Connections per file. Override with FINAL_CONNECTIONS."""
+    raw = os.environ.get("FINAL_CONNECTIONS", "")
+    if raw.isdigit() and int(raw) > 0:
+        return max(1, min(MAX_CONNECTIONS, int(raw)))
+    return DEFAULT_CONNECTIONS
+
+
+class Transport:
+    """One account's reusable MTProto connections.
+
+    Senders are opened on first use and kept for the whole run: a batch of
+    thousands of videos would otherwise spend most of its time on handshakes.
+    Download senders are keyed by the source's data centre, and uploads always
+    go to the account's own one.
+    """
+
+    def __init__(self, client: TelegramClient, count: int) -> None:
+        self.client = client
+        self.count = count
+        self._download: dict[int, list[Any]] = {}
+        self._upload: list[Any] | None = None
+        self._guard = asyncio.Lock()
+
+    async def download_senders(self, dc_id: int) -> list[Any]:
+        async with self._guard:
+            senders = self._download.get(dc_id)
+            if senders is None:
+                senders = await open_transfer_senders(self.client, dc_id, self.count)
+                self._download[dc_id] = senders
+            return senders
+
+    async def upload_senders(self) -> list[Any]:
+        async with self._guard:
+            if self._upload is None:
+                own_dc = int(cast(Any, self.client.session).dc_id)
+                self._upload = await open_transfer_senders(
+                    self.client, own_dc, self.count
+                )
+            return self._upload
+
+    async def close(self) -> None:
+        for senders in self._download.values():
+            await close_transfer_senders(senders)
+        self._download.clear()
+        if self._upload is not None:
+            await close_transfer_senders(self._upload)
+            self._upload = None
+
+
+async def worker_transport(session: Worker) -> Transport:
+    """This account's connection pool, opened on first use."""
+    if session.transport is None:
+        session.transport = Transport(session.client, transfer_connections())
+    return cast(Transport, session.transport)
+
+
+async def close_transports(pool: Sequence[Worker]) -> None:
+    """Shut the pooled connections down before the clients disconnect."""
+    for session in pool:
+        if session.transport is not None:
+            with contextlib.suppress(Exception):
+                await session.transport.close()
+            session.transport = None
+
+
+async def stream_copy(
+    transport: Transport,
+    document: Any,
+    name: str,
+    size: int,
+    progress: Callable[[int], None],
+) -> types.InputFileBig:
+    """Move a file straight from the source to Telegram without touching disk.
+
+    Each pipeline fetches one 512 KiB part and immediately pushes it back up, so
+    downloading and uploading overlap instead of running one after the other.
+    That alone halves the time per video, and nothing is written to disk, which
+    matters when several accounts each handle a large file at once.
+
+    512 KiB is the part size because Telegram needs a download limit that
+    divides 1 MiB and an upload part of at most 512 KiB, so one size satisfies
+    both and every downloaded part maps to exactly one uploaded part.
+    """
+    dc_id, location = utils.get_input_location(document)
+    total_parts = math.ceil(size / PART_SIZE)
+    if total_parts > MAX_UPLOAD_PARTS:
+        raise RuntimeError(
+            f"{human_size(size)} needs {total_parts} parts, over Telegram's "
+            f"{MAX_UPLOAD_PARTS} limit."
+        )
+    file_id = helpers.generate_random_long()
+    download = await transport.download_senders(dc_id)
+    upload = await transport.upload_senders()
+    lanes = min(len(download), len(upload), total_parts) or 1
+    moved = 0
+    guard = asyncio.Lock()
+
+    async def pipeline(start: int) -> None:
+        nonlocal moved
+        down_sender = download[start]
+        up_sender = upload[start]
+        part = start
+        while part < total_parts:
+            offset = part * PART_SIZE
+            fetched = await call_part(
+                transport.client,
+                down_sender,
+                GetFileRequest(location, offset=offset, limit=PART_SIZE),
+                f"stream down part {part}",
+            )
+            chunk = getattr(fetched, "bytes", b"")
+            if not chunk:
+                raise RuntimeError(
+                    f"Telegram returned no data for part {part} of {name}."
+                )
+            await call_part(
+                transport.client,
+                up_sender,
+                SaveBigFilePartRequest(
+                    file_id=file_id,
+                    file_part=part,
+                    file_total_parts=total_parts,
+                    bytes=chunk,
+                ),
+                f"stream up part {part}",
+            )
+            async with guard:
+                moved += len(chunk)
+                progress(moved)
+            part += lanes
+
+    await asyncio.gather(*(pipeline(index) for index in range(lanes)))
+    return types.InputFileBig(id=file_id, parts=total_parts, name=name)
+
+
+async def pooled_download(
+    transport: Transport,
+    document: Any,
+    dest_path: Path,
+    size: int,
+    progress: Callable[[int], None],
+) -> None:
+    """Download to disk over the pooled connections.
+
+    Only needed when a thumbnail has to be generated from the video itself,
+    since ffmpeg needs a real file to read a frame out of.
+    """
+    dc_id, location = utils.get_input_location(document)
+    total_parts = math.ceil(size / PART_SIZE)
+    senders = await transport.download_senders(dc_id)
+    lanes = min(len(senders), total_parts) or 1
+    handle = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.ftruncate(handle, size)
+    done = 0
+    guard = asyncio.Lock()
+
+    async def pipeline(start: int) -> None:
+        nonlocal done
+        sender = senders[start]
+        part = start
+        while part < total_parts:
+            offset = part * PART_SIZE
+            fetched = await call_part(
+                transport.client,
+                sender,
+                GetFileRequest(location, offset=offset, limit=PART_SIZE),
+                f"download part {part}",
+            )
+            chunk = getattr(fetched, "bytes", b"")
+            if chunk:
+                os.pwrite(handle, chunk, offset)
+                async with guard:
+                    done += len(chunk)
+                    progress(done)
+            part += lanes
+
+    try:
+        await asyncio.gather(*(pipeline(index) for index in range(lanes)))
+    finally:
+        os.close(handle)
+
+
+async def pooled_upload(
+    transport: Transport,
+    file_path: Path,
+    size: int,
+    name: str,
+    progress: Callable[[int], None],
+) -> types.InputFileBig:
+    """Upload a local file over the pooled connections."""
+    total_parts = math.ceil(size / PART_SIZE)
+    if total_parts > MAX_UPLOAD_PARTS:
+        raise RuntimeError(
+            f"{human_size(size)} needs {total_parts} parts, over Telegram's "
+            f"{MAX_UPLOAD_PARTS} limit."
+        )
+    file_id = helpers.generate_random_long()
+    senders = await transport.upload_senders()
+    lanes = min(len(senders), total_parts) or 1
+    handle = os.open(file_path, os.O_RDONLY)
+    done = 0
+    guard = asyncio.Lock()
+
+    async def pipeline(start: int) -> None:
+        nonlocal done
+        sender = senders[start]
+        part = start
+        while part < total_parts:
+            offset = part * PART_SIZE
+            chunk = os.pread(handle, PART_SIZE, offset)
+            if not chunk:
+                break
+            await call_part(
+                transport.client,
+                sender,
+                SaveBigFilePartRequest(
+                    file_id=file_id,
+                    file_part=part,
+                    file_total_parts=total_parts,
+                    bytes=chunk,
+                ),
+                f"upload part {part}",
+            )
+            async with guard:
+                done += len(chunk)
+                progress(done)
+            part += lanes
+
+    try:
+        await asyncio.gather(*(pipeline(index) for index in range(lanes)))
+    finally:
+        os.close(handle)
+    return types.InputFileBig(id=file_id, parts=total_parts, name=name)
+
+
+# ---------------------------------------------------------------------------
 # Thumbnails
 # ---------------------------------------------------------------------------
 # A document re-uploaded with no `thumb` is the blank grey preview, so the
@@ -1658,30 +2010,31 @@ async def copy_video(
     temp_dir: Path,
     dashboard: Dashboard,
     lane: TaskID,
+    *,
+    pointer: PointerState,
 ) -> CopyOutcome:
     """Copy one video, keeping its preview visible.
 
-    Two routes:
+    Three routes, cheapest first:
 
     * **pointer copy** — ``send_file(file=message.media)`` has the server clone
-      the existing document, so no bytes move and the preview comes along
-      untouched. This is the normal case and it is near-instant.
-    * **re-upload** — used when the chat forbids saving content, when the file
-      reference has gone stale, *and* when the source itself has no preview and
-      ffmpeg is around to make one (a pointer copy of a thumbnail-less video
-      would be just as blank at the destination). The ``thumb`` that the
-      sibling scripts never set is set here.
+      the document, so no bytes move at all. Skipped entirely when the source
+      has "restrict saving content" set, because it can only fail there, and a
+      doomed round trip per video is thousands of wasted requests.
+    * **stream** — parts are pulled from the source and pushed straight back up
+      without touching disk, download and upload overlapping.
+    * **disk** — only when a thumbnail has to be generated, since ffmpeg needs a
+      real file. The ``thumb`` that the sibling scripts never set is set on both
+      transfer routes.
     """
     client = session.client
     caption = video_caption(message.id)
     document = cast(Any, message).document
     source_thumb = pick_thumb(document) if document is not None else None
-    # A pointer copy is only worth taking if the result will have a preview,
-    # or if we have no way of making one anyway.
     can_generate = ffmpeg_available() and document is not None
-    prefer_pointer = source_thumb is not None or not can_generate
-
-    if prefer_pointer:
+    # A pointer copy is only worth taking if the result will have a preview, or
+    # if we have no way of making one anyway.
+    if pointer.allowed and (source_thumb is not None or not can_generate):
         dashboard.transfer.update(
             lane, description=f"{session.label} link #{message.id}"
         )
@@ -1697,42 +2050,63 @@ async def copy_video(
                 retry_server_errors=False,
             )
             return CopyOutcome("linked", sent_has_thumb(sent))
-        except (
-            ChatForwardsRestrictedError,
-            MediaEmptyError,
-            FileReferenceExpiredError,
-        ):
-            # Protected chat or stale reference: fall through and move bytes.
+        except ChatForwardsRestrictedError:
+            # The whole source is protected, so stop trying for the rest of it.
+            pointer.allowed = False
+        except (MediaEmptyError, FileReferenceExpiredError):
+            # Just this reference is stale: fall through and move the bytes.
             pass
 
     if document is None:
         raise RuntimeError("This video message has no document to copy.")
 
     size = int(getattr(document, "size", 0) or 0)
+    if size <= 0:
+        raise RuntimeError("Telegram reported no size for this video.")
     file_name = document_filename(document, message.id)
-    media_path = temp_dir / f"{session.label}_{message.id}_{file_name}"
     attributes, duration, nosound = video_attributes(document, source_thumb)
+    transport = await worker_transport(session)
 
-    def on_progress(current: int, total: int) -> None:
-        dashboard.transfer.update(lane, completed=current, total=total or None)
+    def on_progress(done: int) -> None:
+        dashboard.transfer.update(lane, completed=done, total=size)
 
+    # The source's own preview is cheap and always preferred; only a video with
+    # none needs the local file so ffmpeg can cut a frame out of it.
+    thumb_data = await source_thumb_bytes(client, message, document)
+    media_path: Path | None = None
     try:
-        dashboard.transfer.reset(
-            lane,
-            description=f"{session.label} ↓ #{message.id}",
-            total=size or None,
-            start=True,
-        )
-        await rpc_call(
-            f"{session.label}: download #{message.id}",
-            lambda: parallel_download(client, document, media_path, on_progress),
-            retry_server_errors=False,
-        )
-
-        # Prefer the source's own preview; make one only when there is none.
-        thumb_data = await source_thumb_bytes(client, message, document)
-        if thumb_data is None:
+        if thumb_data is None and can_generate:
+            media_path = temp_dir / f"{session.label}_{message.id}_{file_name}"
+            dashboard.transfer.reset(
+                lane,
+                description=f"{session.label} ↓ #{message.id}",
+                total=size,
+                start=True,
+            )
+            await pooled_download(
+                transport, document, media_path, size, on_progress
+            )
             thumb_data = await generate_thumb_bytes(media_path, duration)
+            dashboard.transfer.reset(
+                lane,
+                description=f"{session.label} ↑ #{message.id}",
+                total=size,
+                start=True,
+            )
+            input_file: Any = await pooled_upload(
+                transport, media_path, size, file_name, on_progress
+            )
+        else:
+            dashboard.transfer.reset(
+                lane,
+                description=f"{session.label} ⇄ #{message.id}",
+                total=size,
+                start=True,
+            )
+            input_file = await stream_copy(
+                transport, document, file_name, size, on_progress
+            )
+
         thumb_file = None
         if thumb_data:
             try:
@@ -1742,56 +2116,22 @@ async def copy_video(
             except (RPCError, RuntimeError, ValueError, TypeError):
                 thumb_file = None
 
-        actual_size = media_path.stat().st_size
-        total_parts = math.ceil(actual_size / PART_SIZE) if actual_size else 0
-        dashboard.transfer.reset(
-            lane,
-            description=f"{session.label} ↑ #{message.id}",
-            total=actual_size or None,
-            start=True,
+        media = types.InputMediaUploadedDocument(
+            file=input_file,
+            thumb=thumb_file,
+            mime_type=document.mime_type or "video/mp4",
+            attributes=attributes,
+            nosound_video=nosound or None,
         )
-
-        if 0 < actual_size and total_parts <= MAX_UPLOAD_PARTS:
-            input_file = await rpc_call(
-                f"{session.label}: upload #{message.id}",
-                lambda: parallel_upload(
-                    client, media_path, actual_size, file_name, on_progress
-                ),
-                retry_server_errors=False,
-            )
-            media = types.InputMediaUploadedDocument(
-                file=input_file,
-                thumb=thumb_file,
-                mime_type=document.mime_type or "video/mp4",
-                attributes=attributes,
-                nosound_video=nosound or None,
-            )
-            sent = await rpc_call(
-                f"{session.label}: send #{message.id}",
-                lambda: client.send_file(destination, file=media, caption=caption),
-                retry_server_errors=False,
-            )
-        else:
-            # Oversized or empty: hand the path to Telethon, which reads the
-            # metadata with hachoir. The thumbnail still has to be passed in.
-            sent = await rpc_call(
-                f"{session.label}: send #{message.id}",
-                lambda: client.send_file(
-                    destination,
-                    file=str(media_path),
-                    caption=caption,
-                    # Already an InputFile, so Telethon reuses it as-is
-                    # instead of uploading the preview a second time.
-                    thumb=thumb_file,
-                    force_document=False,
-                    supports_streaming=True,
-                    progress_callback=on_progress,
-                ),
-                retry_server_errors=False,
-            )
+        sent = await rpc_call(
+            f"{session.label}: send #{message.id}",
+            lambda: client.send_file(destination, file=media, caption=caption),
+            retry_server_errors=False,
+        )
         return CopyOutcome("re-uploaded", sent_has_thumb(sent))
     finally:
-        media_path.unlink(missing_ok=True)
+        if media_path is not None:
+            media_path.unlink(missing_ok=True)
         dashboard.transfer.update(
             lane, description=f"{session.label} idle", completed=0, total=None
         )
@@ -1813,11 +2153,47 @@ class GroupResult:
     failed: int = 0
     skipped: int = 0
     already: int = 0
+    deferred: int = 0
     no_thumb: int = 0
     locked: bool = False
     members_restricted: bool = False
     posters: list[str] = field(default_factory=list)
     error: str | None = None
+
+
+# Errors that mean this account can never post here, however many times it
+# tries: a peer it cannot address, a permission it does not have, or a dead
+# session. The video is given back to the queue and the account is ejected,
+# because retrying it would just burn the whole queue (which is what a single
+# broken worker did before: it failed instantly, so it won the race for every
+# video and marked thousands of them failed).
+FATAL_WORKER_ERRORS = (
+    PeerIdInvalidError,
+    ChannelInvalidError,
+    ChannelPrivateError,
+    ChatWriteForbiddenError,
+    ChatAdminRequiredError,
+    UserBannedInChannelError,
+    ChatSendMediaForbiddenError,
+    ChatSendVideosForbiddenError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+    SessionRevokedError,
+)
+
+
+@dataclass(slots=True)
+class PointerState:
+    """Whether a pointer copy is still worth attempting for this source.
+
+    A chat with "restrict saving content" refuses every pointer copy, so after
+    the first refusal the attempt is dropped for the rest of the source. Over
+    thousands of videos that is thousands of pointless round trips saved.
+    """
+
+    allowed: bool = True
+    announced: bool = False
 
 
 async def copy_plan(
@@ -1828,23 +2204,53 @@ async def copy_plan(
     eta: Eta,
     dashboard: Dashboard,
     result: GroupResult,
+    pointer: PointerState,
 ) -> None:
     """Spread one source's pending videos across every account that can post.
 
     Each account pulls the next id off a shared queue and copies it end to end
-    on its own connections, so N accounts give roughly N times the throughput.
-    A throttled account is parked and its video handed back to the queue rather
-    than burned as a failure.
+    on its own connections. An account that is throttled, broken or unable to
+    post is taken out and its video handed back, so the queue always drains
+    through whatever is still healthy rather than being consumed by a session
+    that fails instantly.
     """
     queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
     for item in plan.pending:
         queue.put_nowait(item)
     guard = asyncio.Lock()
+    ejected: set[str] = set()
+    streak: dict[str, int] = {}
+
+    async def eject(session: Worker, message_id: int, size: int, why: str) -> None:
+        """Retire a session and give its current video back to the queue."""
+        ejected.add(session.label)
+        session.last_error = why[:120]
+        queue.put_nowait((message_id, size))
+        remaining = [
+            other.label
+            for other, _s, _d, _l in lanes
+            if other.label not in ejected
+        ]
+        console.print(
+            f"  [red]⊘[/red] {session.label} taken out of this source "
+            f"({escape(why)}); #{message_id} requeued"
+        )
+        if remaining:
+            console.print(
+                f"  [dim]still posting via {', '.join(sorted(set(remaining)))}[/dim]"
+            )
+        else:
+            console.print(
+                "  [yellow]no account left for this source; the rest is left "
+                "for a rerun[/yellow]"
+            )
 
     async def consume(
         session: Worker, source_peer: Any, dest_peer: Any, lane: TaskID
     ) -> None:
         while True:
+            if session.label in ejected:
+                return
             try:
                 message_id, size = queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -1870,13 +2276,27 @@ async def copy_plan(
                     )
                     continue
 
+                was_allowed = pointer.allowed
                 outcome = await copy_video(
-                    session, dest_peer, message, temp_dir, dashboard, lane
+                    session,
+                    dest_peer,
+                    message,
+                    temp_dir,
+                    dashboard,
+                    lane,
+                    pointer=pointer,
                 )
+                if was_allowed and not pointer.allowed and not pointer.announced:
+                    pointer.announced = True
+                    console.print(
+                        f"[dim]{escape(plan.title)} restricts saving, so every "
+                        f"video is re-uploaded; not trying to link again.[/dim]"
+                    )
                 await state.mark_copied(plan.brand, plan.key, plan.title, message_id)
                 async with guard:
                     result.copied += 1
                     session.copied += 1
+                    streak[session.label] = 0
                     if not outcome.thumbnail:
                         result.no_thumb += 1
                     eta.complete(size)
@@ -1896,8 +2316,23 @@ async def copy_plan(
                     f"requeued #{message_id}[/yellow]"
                 )
                 return
+            except FATAL_WORKER_ERRORS as error:
+                async with guard:
+                    await eject(session, message_id, size, _short(error))
+                return
             except Exception as error:  # noqa: BLE001 - one video must not stop the run
                 async with guard:
+                    hits = streak.get(session.label, 0) + 1
+                    streak[session.label] = hits
+                    if hits >= MAX_CONSECUTIVE_FAILURES:
+                        # Not this video's fault; the session is unwell.
+                        await eject(
+                            session,
+                            message_id,
+                            size,
+                            f"{hits} failures in a row, last: {_short(error)}",
+                        )
+                        return
                     result.failed += 1
                     session.failed += 1
                     session.last_error = str(error)
@@ -1962,6 +2397,69 @@ async def resolve_destination(
     return channel, title, link
 
 
+def parallel_videos() -> int:
+    """Videos one account copies at once. Override with FINAL_PARALLEL_VIDEOS."""
+    raw = os.environ.get("FINAL_PARALLEL_VIDEOS", "")
+    if raw.isdigit() and int(raw) > 0:
+        return max(1, min(MAX_PARALLEL_VIDEOS, int(raw)))
+    return DEFAULT_PARALLEL_VIDEOS
+
+
+async def verified_dest_peer(
+    worker: Worker, channel_id: int, fallback: Any
+) -> Any | None:
+    """Get a destination handle this worker can really send media to.
+
+    A worker freshly added to a group often has no access hash for it, and
+    Telethon then falls back to a stub peer that resolves but is rejected by
+    ``SendMedia`` with "invalid Peer" — thousands of times in a row, which is
+    what happened. Asking Telegram for the channel yields this account's own
+    access hash, and a participant lookup proves the handle works before any
+    video is handed to it.
+    """
+    client = worker.client
+    peer = fallback
+    try:
+        got = cast(
+            Any,
+            await rpc_call(
+                f"{worker.label}: resolve destination",
+                lambda: client(
+                    channels.GetChannelsRequest(
+                        [types.InputChannel(channel_id, access_hash=0)]
+                    )
+                ),
+                retry_server_errors=False,
+            ),
+        )
+        channel = next(
+            (chat for chat in got.chats if isinstance(chat, types.Channel)), None
+        )
+        if channel is not None and channel.access_hash is not None:
+            peer = types.InputPeerChannel(
+                channel_id=channel.id, access_hash=channel.access_hash
+            )
+    except (RPCError, RuntimeError, ValueError, TypeError):
+        pass
+    if peer is None:
+        return None
+    try:
+        await rpc_call(
+            f"{worker.label}: confirm membership",
+            lambda: client(
+                channels.GetParticipantRequest(
+                    channel=cast(Any, utils.get_input_channel(peer)),
+                    participant=types.InputPeerSelf(),
+                )
+            ),
+            retry_server_errors=False,
+        )
+    except (RPCError, RuntimeError, ValueError, TypeError) as error:
+        worker.last_error = f"destination: {_short(error)}"
+        return None
+    return peer
+
+
 async def run_group(
     pool: list[Worker],
     brand: str,
@@ -1971,14 +2469,19 @@ async def run_group(
     eta: Eta,
     dashboard: Dashboard,
 ) -> GroupResult:
-    """Provision one destination group, fill it, then freeze it."""
+    """Provision one destination group and fill it.
+
+    Freezing is not done here: that waits until every group is finished and the
+    choice about oversized videos has been made, so a group is only closed once
+    there is genuinely nothing more to put in it.
+    """
     owner = pool[0]
     result = GroupResult(
         brand=brand,
         title=group_title(plans[0].title),
         sources=[plan.title for plan in plans],
         already=sum(plan.already for plan in plans),
-        skipped=sum(plan.skipped for plan in plans),
+        deferred=sum(len(plan.big) for plan in plans),
     )
     console.rule(f"[bold bright_magenta]{escape(result.title)}[/bold bright_magenta]")
 
@@ -2000,15 +2503,10 @@ async def run_group(
     if link:
         print_named_link(title, link)
 
-    # Take the group's name and photo away from normal members immediately and
-    # permanently. Sending is left at Telegram's default for now and switched
-    # off once this group's work is done, further down.
-    has_work = any(plan.pending for plan in plans)
+    # Take the group's name and photo away from normal members straight away
+    # and permanently. Sending stays open until the whole run is done.
     result.members_restricted = await apply_member_rights(
-        owner.client,
-        destination,
-        allow_sending=has_work,
-        label="restrict members",
+        owner.client, destination, allow_sending=True, label="restrict members"
     )
     await make_owner_anonymous(owner, destination)
 
@@ -2039,17 +2537,16 @@ async def run_group(
 
     channel_id = int(getattr(destination, "channel_id", getattr(destination, "id", 0)))
     primary = plans[0].source
+    slots = parallel_videos()
 
-    # Build the posting roster: every worker that can both read the source and
-    # post into this group, each one promoted anonymously.
     for plan in plans:
-        entry_link = None
-        roster: list[tuple[Worker, Any, Any]] = []
-        inviters: list[Worker] = [owner]
-
         if not plan.pending:
             console.print(f"[dim]{escape(plan.title)} · nothing new[/dim]")
             continue
+
+        entry_link = None
+        roster: list[tuple[Worker, Any, Any]] = []
+        inviters: list[Worker] = [owner]
 
         if len(pool) > 1:
             entry_link = await source_entry_link(owner.client, plan.source)
@@ -2064,10 +2561,10 @@ async def run_group(
             )
             if source_peer is None:
                 continue
-            dest_peer = await attach_worker_to_group(
+            attached = await attach_worker_to_group(
                 cast(Any, inviters), worker, primary, channel_id, result.invite_link
             )
-            if dest_peer is None:
+            if attached is None:
                 worker.last_error = "could not be added to the backup group"
                 console.print(
                     f"[yellow]{worker.label} could not be added to "
@@ -2085,6 +2582,16 @@ async def run_group(
                 )
                 continue
             inviters.append(worker)
+            # Prove the handle works now, rather than discovering per video
+            # that every send is rejected.
+            dest_peer = await verified_dest_peer(worker, channel_id, attached)
+            if dest_peer is None:
+                console.print(
+                    f"[yellow]{worker.label} cannot address "
+                    f"{escape(result.title)} ({escape(worker.last_error)}); it "
+                    f"sits this group out.[/yellow]"
+                )
+                continue
             roster.append((worker, source_peer, dest_peer))
 
         now = time.monotonic()
@@ -2115,42 +2622,36 @@ async def run_group(
                 )
             ready = [(owner, owner_source, destination)]
 
-        # Give each poster its own progress row in the live dashboard.
-        assigned = [
-            (session, source_peer, dest_peer, dashboard.lane(session.label))
-            for session, source_peer, dest_peer in ready
-        ]
+        # Each account gets several slots, so the connections stay busy while
+        # one video is finishing and the next is starting. Every slot needs its
+        # own progress row.
+        assigned: list[tuple[Worker, Any, Any, TaskID]] = []
+        for session, source_peer, dest_peer in ready:
+            for slot in range(slots):
+                label = session.label if slots == 1 else f"{session.label}.{slot + 1}"
+                assigned.append(
+                    (session, source_peer, dest_peer, dashboard.lane(label))
+                )
         result.posters = sorted(
             {*result.posters, *(session.label for session, _s, _d, _l in assigned)}
         )
+        posting = ", ".join(sorted({s.label for s, _s, _d, _l in assigned}))
         console.print(
             f"[dim]{escape(plan.title)} · {len(plan.pending)} video(s) · "
-            f"posting via {', '.join(s.label for s, _s, _d, _l in assigned)}[/dim]"
+            f"posting via {posting} · {slots} at a time each · "
+            f"{transfer_connections()} connections per video[/dim]"
+        )
+        pointer = PointerState(
+            allowed=not bool(getattr(plan.source, "noforwards", False))
         )
         try:
             await copy_plan(
-                assigned, plan, temp_dir, state, eta, dashboard, result
+                assigned, plan, temp_dir, state, eta, dashboard, result, pointer
             )
         finally:
             for _session, _sp, _dp, lane in assigned:
                 dashboard.transfer.remove_task(lane)
 
-    # The work for this group is finished, so turn sending off for members.
-    if result.destination is not None and not result.failed:
-        result.locked = await apply_member_rights(
-            owner.client, destination, allow_sending=False, label="freeze group"
-        )
-        if result.locked:
-            await state.remember_group(brand, {"locked": True})
-            console.print(
-                f"[bright_magenta]🔒 {escape(result.title)} is now read-only "
-                f"for members[/bright_magenta]"
-            )
-    elif result.failed:
-        console.print(
-            f"[yellow]{result.failed} video(s) failed, so "
-            f"{escape(result.title)} is left open for a rerun.[/yellow]"
-        )
     return result
 
 
@@ -2207,37 +2708,102 @@ async def create_folder(
         return None
 
 
-async def finish_idle_groups(
-    owner: Worker, brands: Iterable[str], state: FinalState
-) -> int:
-    """Freeze any already-finished group that a previous run left open.
+def merge_result(into: GroupResult, extra: GroupResult) -> None:
+    """Fold a second pass over the same group into its first result."""
+    into.copied += extra.copied
+    into.failed += extra.failed
+    into.skipped += extra.skipped
+    into.no_thumb += extra.no_thumb
+    into.deferred = extra.deferred
+    into.posters = sorted({*into.posters, *extra.posters})
+    if extra.destination is not None:
+        into.destination = extra.destination
+        into.invite_link = extra.invite_link or into.invite_link
+        into.title = extra.title
+    into.error = extra.error or into.error
 
-    Reached when there is nothing new to copy. A run that was interrupted
-    between its last video and the freeze step would otherwise leave a group
-    writable forever, since the next run has no work and would skip it. No new
-    group is ever created here.
+
+async def run_pass(
+    pool: list[Worker],
+    by_brand: dict[str, list[Plan]],
+    state: FinalState,
+    eta: Eta,
+    temp_dir: Path,
+    merged: dict[str, GroupResult],
+    label: str,
+) -> None:
+    """Fill every destination group once, under one live dashboard."""
+    with Dashboard(eta, label) as dashboard:
+        for brand, plans in by_brand.items():
+            result = await run_group(
+                pool, brand, plans, temp_dir, state, eta, dashboard
+            )
+            if brand in merged:
+                merge_result(merged[brand], result)
+            else:
+                merged[brand] = result
+
+
+def ask_oversized(count: int, total_bytes: int) -> bool:
+    """Offer the held-back oversized videos once everything else is done."""
+    console.print(
+        Panel(
+            f"[bold]{count}[/bold] video(s) are over "
+            f"{human_size(MAX_VIDEO_BYTES)} and were held back "
+            f"[dim]({human_size(total_bytes)} in total)[/dim]\n"
+            f"[dim]'done' finishes and locks the groups · 'high' copies these "
+            f"first, then locks[/dim]",
+            border_style="bright_magenta",
+            padding=(1, 3),
+        )
+    )
+    while True:
+        answer = (
+            Prompt.ask(
+                "[bright_cyan]done or high[/bright_cyan]", default="done"
+            )
+            .strip()
+            .lower()
+        )
+        if answer in {"d", "done", "n", "no"}:
+            return False
+        if answer in {"h", "high", "y", "yes"}:
+            return True
+        console.print("[yellow]Type 'done' or 'high'.[/yellow]")
+
+
+async def freeze_groups(
+    owner: Worker, results: Sequence[GroupResult], state: FinalState
+) -> int:
+    """Turn message sending off for normal members, now the work is finished.
+
+    Members already lost the group name and photo when the group was made; this
+    is the final step that closes it for sending. Admins are exempt from a
+    chat's default rights, so a later rerun can still add to a frozen group. A
+    group with failures is left open so the rerun has somewhere to put them.
     """
     frozen = 0
-    for brand in brands:
-        record = state.groups.get(brand)
-        if not record or record.get("locked"):
+    for result in results:
+        if result.destination is None:
             continue
-        try:
-            peer = types.InputPeerChannel(
-                channel_id=int(record["channel_id"]),
-                access_hash=int(record["access_hash"]),
+        if result.failed:
+            console.print(
+                f"[yellow]{result.failed} video(s) failed, so "
+                f"{escape(result.title)} stays open for a rerun.[/yellow]"
             )
-        except (KeyError, TypeError, ValueError):
             continue
-        title = str(record.get("title") or brand)
         if await apply_member_rights(
-            owner.client, peer, allow_sending=False, label=f"freeze {title}"
+            owner.client,
+            result.destination,
+            allow_sending=False,
+            label=f"freeze {result.title}",
         ):
-            await state.remember_group(brand, {"locked": True})
+            result.locked = True
+            await state.remember_group(result.brand, {"locked": True})
             frozen += 1
             console.print(
-                f"[bright_magenta]🔒 {escape(title)} is now read-only for "
-                f"members[/bright_magenta]"
+                f"[bright_magenta]🔒 {escape(result.title)} is now read-only "
+                f"for members[/bright_magenta]"
             )
     return frozen
 
@@ -2257,7 +2823,7 @@ def group_status(result: GroupResult) -> str:
 def show_report(
     results: Sequence[GroupResult],
     pool: Sequence[Worker],
-    eta: Eta,
+    elapsed: float,
     folder: tuple[str, str] | None,
 ) -> bool:
     table = Table(
@@ -2269,7 +2835,8 @@ def show_report(
     table.add_column("Sources")
     table.add_column("New", justify="right")
     table.add_column("Before", justify="right")
-    table.add_column("Skipped", justify="right")
+    table.add_column("Gone", justify="right")
+    table.add_column("Oversized", justify="right")
     table.add_column("Failed", justify="right")
     table.add_column("No preview", justify="right")
     table.add_column("Status")
@@ -2280,6 +2847,7 @@ def show_report(
             str(result.copied),
             str(result.already),
             str(result.skipped),
+            str(result.deferred) if result.deferred else "—",
             str(result.failed),
             str(result.no_thumb) if result.no_thumb else "—",
             group_status(result),
@@ -2313,6 +2881,7 @@ def show_report(
     copied = sum(result.copied for result in results)
     failed = sum(result.failed for result in results)
     blank = sum(result.no_thumb for result in results)
+    deferred = sum(result.deferred for result in results)
     locked = sum(1 for result in results if result.locked)
     complete = bool(results) and all(
         group_status(result).startswith("complete") for result in results
@@ -2336,13 +2905,18 @@ def show_report(
                 f"[bold]{copied}[/bold] video(s) copied · "
                 f"[bold]{locked}[/bold]/{len(results)} group(s) locked · "
                 f"{failed} failed\n"
-                f"[dim]took {format_duration(eta.elapsed)} · "
+                f"[dim]took {format_duration(elapsed)} · "
                 f"finished {datetime.now().strftime('%H:%M:%S')}[/dim]"
             ),
             border_style=style,
             padding=(1, 3),
         )
     )
+    if deferred:
+        console.print(
+            f"[yellow]{deferred} oversized video(s) were left; rerun and choose "
+            f"'high' to copy them.[/yellow]"
+        )
     if blank:
         hint = (
             "install ffmpeg and rerun to generate previews for them"
@@ -2365,6 +2939,7 @@ def show_report(
 async def run() -> bool:
     banner()
     _silence_shutdown_noise()
+    started = time.monotonic()
     pool: list[Worker] = []
     try:
         pool, _api_id, _api_hash = await authenticate()
@@ -2374,48 +2949,67 @@ async def run() -> bool:
         sources = await choose_sources(owner.client, state)
         if not sources:
             raise RuntimeError("No source group was selected.")
-        if len(sources) > MAX_GROUPS:
-            sources = sources[:MAX_GROUPS]
+        sources = sources[:MAX_GROUPS]
 
-        console.print("\n[dim]Scanning the selected groups for videos…[/dim]")
+        console.print("\n[dim]Working out what is left to copy…[/dim]")
         plans = [await build_plan(owner.client, source, state) for source in sources]
         show_plan(plans)
-
-        eta = Eta()
-        for plan in plans:
-            eta.plan(size for _id, size in plan.pending)
-        if not eta.total_videos:
-            console.print(
-                f"\n[green]Everything is already backed up {HEART}[/green] "
-                f"[dim]nothing new to copy[/dim]"
-            )
-            await finish_idle_groups(
-                owner, {plan.brand for plan in plans}, state
-            )
-            return True
+        console.print(
+            f"[dim]{transfer_connections()} connections per video · "
+            f"{parallel_videos()} video(s) at a time per account "
+            f"(FINAL_CONNECTIONS / FINAL_PARALLEL_VIDEOS to change)[/dim]"
+        )
         if not ffmpeg_available():
             console.print(
                 "[dim]ffmpeg not found — source previews are reused, but one "
                 "cannot be generated for a video that has none.[/dim]"
             )
 
-        # Sibling sources share a destination, so work is grouped by brand and
-        # a group is only frozen once every one of its sources is finished.
+        # Sibling sources share a destination, so work is grouped by brand.
         by_brand: dict[str, list[Plan]] = {}
         for plan in plans:
             by_brand.setdefault(plan.brand, []).append(plan)
 
-        results: list[GroupResult] = []
-        eta.reset_clock()
+        merged: dict[str, GroupResult] = {}
         with tempfile.TemporaryDirectory(prefix="final-") as temp:
             temp_dir = Path(temp)
-            with Dashboard(eta) as dashboard:
-                for brand, brand_plans in by_brand.items():
-                    results.append(
-                        await run_group(
-                            pool, brand, brand_plans, temp_dir, state, eta, dashboard
-                        )
-                    )
+
+            eta = Eta()
+            for plan in plans:
+                eta.plan(size for _id, size in plan.pending)
+            eta.reset_clock()
+            await run_pass(
+                pool, by_brand, state, eta, temp_dir, merged, "backing up"
+            )
+
+            # Everything within the normal limit is done; offer the rest.
+            big_count = sum(len(plan.big) for plan in plans)
+            big_bytes = sum(plan.big_bytes for plan in plans)
+            if big_count and ask_oversized(big_count, big_bytes):
+                for plan in plans:
+                    plan.pending = plan.big
+                    plan.big = []
+                high_eta = Eta()
+                for plan in plans:
+                    high_eta.plan(size for _id, size in plan.pending)
+                high_eta.reset_clock()
+                await run_pass(
+                    pool,
+                    by_brand,
+                    state,
+                    high_eta,
+                    temp_dir,
+                    merged,
+                    "oversized videos",
+                )
+
+        results = [merged[brand] for brand in by_brand if brand in merged]
+        for result in results:
+            result.deferred = sum(
+                len(plan.big) for plan in by_brand[result.brand]
+            )
+
+        await freeze_groups(owner, results, state)
 
         seen: set[int] = set()
         destinations: list[Any] = []
@@ -2435,8 +3029,9 @@ async def run() -> bool:
             destinations.append(result.destination)
 
         folder = await create_folder(owner.client, plans[0].title, destinations)
-        return show_report(results, pool, eta, folder)
+        return show_report(results, pool, time.monotonic() - started, folder)
     finally:
+        await close_transports(pool)
         for session in pool:
             await disconnect_client(session.client)
 
