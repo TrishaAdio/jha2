@@ -163,6 +163,12 @@ THUMB_WIDTH = 320
 # change it, but more worker accounts is what actually scales a run.
 DEFAULT_CONNECTIONS = 4
 MAX_CONNECTIONS = 16
+# Telegram Premium removes the download speed limit, so the reading account can
+# take far more download lanes than an ordinary one. Uploads stay modest per
+# account because that allowance is still metered — the way to upload faster is
+# more uploader accounts, not more sockets on one.
+DEFAULT_READER_CONNECTIONS = 8
+DEFAULT_PREMIUM_READER_CONNECTIONS = 16
 # Videos one account copies at the same time. These share the account's
 # connections rather than adding any, so raising it makes each video slower
 # without making the run faster. One keeps the per-video ETA honest.
@@ -312,6 +318,7 @@ class Worker(Session):
     last_error: str = ""
     username: str = ""
     phone: str = ""
+    premium: bool = False
     transport: Any = None
 
 
@@ -357,6 +364,7 @@ async def authenticate() -> tuple[list[Worker], int, str]:
             name=utils.get_display_name(owner_me) or "",
             username=getattr(owner_me, "username", None) or "",
             phone=getattr(owner_me, "phone", None) or "",
+            premium=bool(getattr(owner_me, "premium", False)),
         )
     ]
 
@@ -397,6 +405,7 @@ async def authenticate() -> tuple[list[Worker], int, str]:
                 name=utils.get_display_name(me) or "",
                 username=getattr(me, "username", None) or "",
                 phone=getattr(me, "phone", None) or "",
+                premium=bool(getattr(me, "premium", False)),
             )
         )
 
@@ -492,12 +501,14 @@ def show_accounts(pool: Sequence[Worker]) -> None:
     table.add_column("Label")
     table.add_column("Name")
     table.add_column("User id", justify="right")
+    table.add_column("Premium")
     table.add_column("Role")
     for session in pool:
         table.add_row(
             session.label,
             escape(session.name or "—"),
             str(session.user_id),
+            "yes" if session.premium else "—",
             "owner" if session.label == "owner" else "worker",
         )
     console.print(table)
@@ -1592,6 +1603,19 @@ async def worker_source_peer(
 # so no video pays for an MTProto handshake.
 
 
+def reader_connections(session: Worker) -> int:
+    """Download lanes for an account. Premium has no speed cap, so it gets more.
+
+    Override with FINAL_DOWNLOAD_CONNECTIONS.
+    """
+    raw = os.environ.get("FINAL_DOWNLOAD_CONNECTIONS", "")
+    if raw.isdigit() and int(raw) > 0:
+        return max(1, min(MAX_CONNECTIONS, int(raw)))
+    if session.premium:
+        return DEFAULT_PREMIUM_READER_CONNECTIONS
+    return DEFAULT_READER_CONNECTIONS
+
+
 def transfer_connections() -> int:
     """Connections per file. Override with FINAL_CONNECTIONS."""
     raw = os.environ.get("FINAL_CONNECTIONS", "")
@@ -1609,9 +1633,12 @@ class Transport:
     go to the account's own one.
     """
 
-    def __init__(self, client: TelegramClient, count: int) -> None:
+    def __init__(
+        self, client: TelegramClient, download_count: int, upload_count: int
+    ) -> None:
         self.client = client
-        self.count = count
+        self.download_count = download_count
+        self.upload_count = upload_count
         self._download: dict[int, list[Any]] = {}
         self._upload: list[Any] | None = None
         self._guard = asyncio.Lock()
@@ -1620,7 +1647,9 @@ class Transport:
         async with self._guard:
             senders = self._download.get(dc_id)
             if senders is None:
-                senders = await open_transfer_senders(self.client, dc_id, self.count)
+                senders = await open_transfer_senders(
+                    self.client, dc_id, self.download_count
+                )
                 self._download[dc_id] = senders
             return senders
 
@@ -1629,7 +1658,7 @@ class Transport:
             if self._upload is None:
                 own_dc = int(cast(Any, self.client.session).dc_id)
                 self._upload = await open_transfer_senders(
-                    self.client, own_dc, self.count
+                    self.client, own_dc, self.upload_count
                 )
             return self._upload
 
@@ -1645,7 +1674,9 @@ class Transport:
 async def worker_transport(session: Worker) -> Transport:
     """This account's connection pool, opened on first use."""
     if session.transport is None:
-        session.transport = Transport(session.client, transfer_connections())
+        session.transport = Transport(
+            session.client, reader_connections(session), transfer_connections()
+        )
     return cast(Transport, session.transport)
 
 
@@ -1658,26 +1689,30 @@ async def close_transports(pool: Sequence[Worker]) -> None:
             session.transport = None
 
 
-async def stream_copy(
-    transport: Transport,
+async def relay_copy(
+    reader: Worker,
+    uploader: Worker,
     document: Any,
     name: str,
     size: int,
     progress: Callable[[int], None],
 ) -> types.InputFileBig:
-    """Move a file from the source straight back up, without touching disk.
+    """Download on one account and upload on another, via this host's memory.
 
-    Fetchers and pushers are independent and meet at a bounded queue, so both
-    directions run at once. Doing the two inside one lane (fetch, then push,
-    then fetch) leaves each connection idle half the time, which is most of why
-    throughput was poor.
+    ``upload.saveBigFilePart`` carries nothing but raw bytes: no peer, no file
+    reference, nothing tied to where the data came from. So the account doing
+    the uploading needs no access whatsoever to the source chat, and the
+    account reading the source never has to post. That is what lets a Premium
+    account, whose download speed is unmetered, feed several ordinary accounts
+    that each upload under their own allowance.
 
-    Downloads use 1 MiB, Telegram's ceiling for a file part, while uploads use
-    the 512 KiB it caps big-file parts at, so each download feeds exactly two
-    uploads and a slow link pays half as many download round trips.
+    The ``file_id`` belongs to the uploader's session, so every part of one
+    video has to come from that same uploader; different videos go to different
+    uploaders instead.
 
-    The queue is bounded, which is what stops a fast source from reading the
-    whole file into memory while the uploads lag behind.
+    Fetching and pushing are independent and meet at a bounded queue, so both
+    run at once and a fast reader cannot buffer a whole file ahead of a slower
+    uploader.
     """
     dc_id, location = utils.get_input_location(document)
     total_up = math.ceil(size / PART_SIZE)
@@ -1688,8 +1723,10 @@ async def stream_copy(
             f"{MAX_UPLOAD_PARTS} limit."
         )
     file_id = helpers.generate_random_long()
-    download = await transport.download_senders(dc_id)
-    upload = await transport.upload_senders()
+    read_transport = await worker_transport(reader)
+    send_transport = await worker_transport(uploader)
+    download = await read_transport.download_senders(dc_id)
+    upload = await send_transport.upload_senders()
     fetchers = min(len(download), total_down) or 1
     pushers = min(len(upload), total_up) or 1
     per_download = DOWNLOAD_PART // PART_SIZE
@@ -1705,10 +1742,10 @@ async def stream_copy(
         while index < total_down:
             offset = index * DOWNLOAD_PART
             fetched = await call_part(
-                transport.client,
+                reader.client,
                 sender,
                 GetFileRequest(location, offset=offset, limit=DOWNLOAD_PART),
-                f"stream down {index}",
+                f"{reader.label} down {index}",
             )
             data = getattr(fetched, "bytes", b"")
             if not data:
@@ -1730,7 +1767,7 @@ async def stream_copy(
                 return
             part, data = item
             await call_part(
-                transport.client,
+                uploader.client,
                 sender,
                 SaveBigFilePartRequest(
                     file_id=file_id,
@@ -1738,7 +1775,7 @@ async def stream_copy(
                     file_total_parts=total_up,
                     bytes=data,
                 ),
-                f"stream up {part}",
+                f"{uploader.label} up {part}",
             )
             async with guard:
                 moved += len(data)
@@ -2041,46 +2078,70 @@ class CopyOutcome:
     thumbnail: bool
 
 
+@dataclass(slots=True)
+class Relay:
+    """One reading account paired with one posting account.
+
+    The reader pulls bytes out of the source; the uploader pushes them into the
+    destination under its own session. When both are the same account the
+    cheap pointer copy is possible; when they differ it is not, because a media
+    pointer is only valid for the account that fetched it.
+    """
+
+    reader: Worker
+    uploader: Worker
+    source_peer: Any
+    dest_peer: Any
+    lane: TaskID
+
+    @property
+    def same_account(self) -> bool:
+        return self.reader.user_id == self.uploader.user_id
+
+    @property
+    def tag(self) -> str:
+        if self.same_account:
+            return self.uploader.label
+        return f"{self.reader.label}→{self.uploader.label}"
+
+
 async def copy_video(
-    session: Worker,
-    destination: Any,
+    relay: Relay,
     message: types.Message,
     temp_dir: Path,
     dashboard: Dashboard,
-    lane: TaskID,
     *,
     pointer: PointerState,
 ) -> CopyOutcome:
-    """Copy one video, keeping its preview visible.
+    """Copy one video into the destination, keeping its preview visible.
 
-    Three routes, cheapest first:
+    * **pointer copy** — only when the reader and uploader are the same
+      account, since a media pointer cannot be handed to another account. Free
+      and instant, and skipped entirely for a source that restricts saving.
+    * **relay** — the reader streams the bytes and the uploader pushes them up
+      under its own session, so the uploader needs no access to the source.
 
-    * **pointer copy** — ``send_file(file=message.media)`` has the server clone
-      the document, so no bytes move at all. Skipped entirely when the source
-      has "restrict saving content" set, because it can only fail there, and a
-      doomed round trip per video is thousands of wasted requests.
-    * **stream** — parts are pulled from the source and pushed straight back up
-      without touching disk, download and upload overlapping.
-    * **disk** — only when a thumbnail has to be generated, since ffmpeg needs a
-      real file. The ``thumb`` that the sibling scripts never set is set on both
-      transfer routes.
+    The ``thumb`` the sibling scripts never set is set on the relay path, which
+    is what keeps previews from coming out blank.
     """
-    client = session.client
+    uploader = relay.uploader
+    lane = relay.lane
     caption = video_caption(message.id)
     document = cast(Any, message).document
     source_thumb = pick_thumb(document) if document is not None else None
     can_generate = ffmpeg_available() and document is not None
-    # A pointer copy is only worth taking if the result will have a preview, or
-    # if we have no way of making one anyway.
-    if pointer.allowed and (source_thumb is not None or not can_generate):
+
+    if relay.same_account and pointer.allowed and (
+        source_thumb is not None or not can_generate
+    ):
         dashboard.transfer.update(
-            lane, description=f"{session.label} link #{message.id}"
+            lane, description=f"{relay.tag} link #{message.id}"
         )
         try:
             sent = await rpc_call(
-                f"{session.label}: copy #{message.id}",
-                lambda: client.send_file(
-                    destination,
+                f"{relay.tag}: copy #{message.id}",
+                lambda: uploader.client.send_file(
+                    relay.dest_peer,
                     file=cast(Any, message.media),
                     caption=caption,
                     supports_streaming=True,
@@ -2103,52 +2164,63 @@ async def copy_video(
         raise RuntimeError("Telegram reported no size for this video.")
     file_name = document_filename(document, message.id)
     attributes, duration, nosound = video_attributes(document, source_thumb)
-    transport = await worker_transport(session)
 
     def on_progress(done: int) -> None:
         dashboard.transfer.update(lane, completed=done, total=size)
 
     # The source's own preview is cheap and always preferred; only a video with
     # none needs the local file so ffmpeg can cut a frame out of it.
-    thumb_data = await source_thumb_bytes(client, message, document)
+    thumb_data = await source_thumb_bytes(
+        relay.reader.client, message, document
+    )
     media_path: Path | None = None
     try:
         if thumb_data is None and can_generate:
-            media_path = temp_dir / f"{session.label}_{message.id}_{file_name}"
+            media_path = temp_dir / f"{uploader.label}_{message.id}_{file_name}"
             dashboard.transfer.reset(
                 lane,
-                description=f"{session.label} ↓ #{message.id}",
+                description=f"{relay.tag} ↓ #{message.id}",
                 total=size,
                 start=True,
             )
             await pooled_download(
-                transport, document, media_path, size, on_progress
+                await worker_transport(relay.reader),
+                document,
+                media_path,
+                size,
+                on_progress,
             )
             thumb_data = await generate_thumb_bytes(media_path, duration)
             dashboard.transfer.reset(
                 lane,
-                description=f"{session.label} ↑ #{message.id}",
+                description=f"{relay.tag} ↑ #{message.id}",
                 total=size,
                 start=True,
             )
             input_file: Any = await pooled_upload(
-                transport, media_path, size, file_name, on_progress
+                await worker_transport(uploader),
+                media_path,
+                size,
+                file_name,
+                on_progress,
             )
         else:
             dashboard.transfer.reset(
                 lane,
-                description=f"{session.label} ⇄ #{message.id}",
+                description=f"{relay.tag} ⇄ #{message.id}",
                 total=size,
                 start=True,
             )
-            input_file = await stream_copy(
-                transport, document, file_name, size, on_progress
+            input_file = await relay_copy(
+                relay.reader, uploader, document, file_name, size, on_progress
             )
 
+        # The preview is uploaded by the account that will post, so the handle
+        # it returns belongs to that account's session.
         thumb_file = None
         if thumb_data:
             try:
-                thumb_file = await client.upload_file(
+                thumb_file = await uploader.client.upload_file(
                     thumb_data, file_name=f"{message.id}_thumb.jpg"
                 )
             except (RPCError, RuntimeError, ValueError, TypeError):
@@ -2162,8 +2234,10 @@ async def copy_video(
             nosound_video=nosound or None,
         )
         sent = await rpc_call(
-            f"{session.label}: send #{message.id}",
-            lambda: client.send_file(destination, file=media, caption=caption),
+            f"{relay.tag}: send #{message.id}",
+            lambda: uploader.client.send_file(
+                relay.dest_peer, file=media, caption=caption
+            ),
             retry_server_errors=False,
         )
         return CopyOutcome("re-uploaded", sent_has_thumb(sent))
@@ -2172,7 +2246,7 @@ async def copy_video(
             media_path.unlink(missing_ok=True)
         dashboard.transfer.reset(
             lane,
-            description=f"{session.label} idle",
+            description=f"{relay.tag} idle",
             total=None,
             start=False,
         )
@@ -2238,7 +2312,7 @@ class PointerState:
 
 
 async def copy_plan(
-    lanes: list[tuple[Worker, Any, Any, TaskID]],
+    relays: list[Relay],
     plan: Plan,
     temp_dir: Path,
     state: FinalState,
@@ -2247,13 +2321,12 @@ async def copy_plan(
     result: GroupResult,
     pointer: PointerState,
 ) -> None:
-    """Spread one source's pending videos across every account that can post.
+    """Drain one source's pending videos through every reader/uploader pair.
 
-    Each account pulls the next id off a shared queue and copies it end to end
-    on its own connections. An account that is throttled, broken or unable to
-    post is taken out and its video handed back, so the queue always drains
-    through whatever is still healthy rather than being consumed by a session
-    that fails instantly.
+    Each pair takes the next id off a shared queue and carries that video end
+    to end. A pair that is throttled, broken or unable to post is taken out and
+    its video handed back, so the queue always drains through whatever is still
+    healthy instead of being consumed by a session that fails instantly.
     """
     queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
     for item in plan.pending:
@@ -2262,47 +2335,43 @@ async def copy_plan(
     ejected: set[str] = set()
     streak: dict[str, int] = {}
 
-    async def eject(session: Worker, message_id: int, size: int, why: str) -> None:
-        """Retire a session and give its current video back to the queue."""
-        ejected.add(session.label)
-        session.last_error = why[:120]
+    async def eject(relay: Relay, message_id: int, size: int, why: str) -> None:
+        """Retire a pair and give its current video back to the queue."""
+        ejected.add(relay.tag)
+        relay.uploader.last_error = why[:120]
         queue.put_nowait((message_id, size))
-        remaining = [
-            other.label
-            for other, _s, _d, _l in lanes
-            if other.label not in ejected
-        ]
+        remaining = sorted(
+            {other.tag for other in relays if other.tag not in ejected}
+        )
         console.print(
-            f"  [red]⊘[/red] {session.label} taken out of this source "
+            f"  [red]⊘[/red] {relay.tag} taken out of this source "
             f"({escape(why)}); #{message_id} requeued"
         )
         if remaining:
-            console.print(
-                f"  [dim]still posting via {', '.join(sorted(set(remaining)))}[/dim]"
-            )
+            console.print(f"  [dim]still posting via {', '.join(remaining)}[/dim]")
         else:
             console.print(
                 "  [yellow]no account left for this source; the rest is left "
                 "for a rerun[/yellow]"
             )
 
-    async def consume(
-        session: Worker, source_peer: Any, dest_peer: Any, lane: TaskID
-    ) -> None:
+    async def consume(relay: Relay) -> None:
+        uploader = relay.uploader
         while True:
-            if session.label in ejected:
+            if relay.tag in ejected:
                 return
             try:
                 message_id, size = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             try:
+                # Only the reader can see the source, so it fetches the message.
                 message = cast(
                     Any,
                     await rpc_call(
-                        f"{session.label}: fetch #{message_id}",
-                        lambda: session.client.get_messages(
-                            source_peer, ids=message_id
+                        f"{relay.reader.label}: fetch #{message_id}",
+                        lambda: relay.reader.client.get_messages(
+                            relay.source_peer, ids=message_id
                         ),
                     ),
                 )
@@ -2319,13 +2388,7 @@ async def copy_plan(
 
                 was_allowed = pointer.allowed
                 outcome = await copy_video(
-                    session,
-                    dest_peer,
-                    message,
-                    temp_dir,
-                    dashboard,
-                    lane,
-                    pointer=pointer,
+                    relay, message, temp_dir, dashboard, pointer=pointer
                 )
                 if was_allowed and not pointer.allowed and not pointer.announced:
                     pointer.announced = True
@@ -2336,8 +2399,8 @@ async def copy_plan(
                 await state.mark_copied(plan.brand, plan.key, plan.title, message_id)
                 async with guard:
                     result.copied += 1
-                    session.copied += 1
-                    streak[session.label] = 0
+                    uploader.copied += 1
+                    streak[relay.tag] = 0
                     if not outcome.thumbnail:
                         result.no_thumb += 1
                     eta.complete(size)
@@ -2345,48 +2408,46 @@ async def copy_plan(
                 note = "" if outcome.thumbnail else " [yellow](no preview)[/yellow]"
                 console.print(
                     f"  [green]✓[/green] #{message_id} {outcome.mode} "
-                    f"[dim]· {session.label}[/dim]{note}"
+                    f"[dim]· {relay.tag}[/dim]{note}"
                 )
             except (FloodWaitError, FloodTooLongError) as error:
                 seconds = int(getattr(error, "seconds", 60))
-                session.cooldown_until = time.monotonic() + seconds
-                session.last_error = f"throttled {seconds}s"
+                uploader.cooldown_until = time.monotonic() + seconds
+                uploader.last_error = f"throttled {seconds}s"
                 queue.put_nowait((message_id, size))
                 console.print(
-                    f"  [yellow]⏸ {session.label} throttled ~{seconds}s; "
+                    f"  [yellow]⏸ {relay.tag} throttled ~{seconds}s; "
                     f"requeued #{message_id}[/yellow]"
                 )
                 return
             except FATAL_WORKER_ERRORS as error:
                 async with guard:
-                    await eject(session, message_id, size, _short(error))
+                    await eject(relay, message_id, size, _short(error))
                 return
             except Exception as error:  # noqa: BLE001 - one video must not stop the run
                 async with guard:
-                    hits = streak.get(session.label, 0) + 1
-                    streak[session.label] = hits
+                    hits = streak.get(relay.tag, 0) + 1
+                    streak[relay.tag] = hits
                     if hits >= MAX_CONSECUTIVE_FAILURES:
-                        # Not this video's fault; the session is unwell.
+                        # Not this video's fault; the pair is unwell.
                         await eject(
-                            session,
+                            relay,
                             message_id,
                             size,
                             f"{hits} failures in a row, last: {_short(error)}",
                         )
                         return
                     result.failed += 1
-                    session.failed += 1
-                    session.last_error = str(error)
+                    uploader.failed += 1
+                    uploader.last_error = str(error)
                     eta.drop(size)
                     dashboard.retotal()
                 console.print(
-                    f"  [red]✗[/red] #{message_id} failed ({session.label}): "
+                    f"  [red]✗[/red] #{message_id} failed ({relay.tag}): "
                     f"{escape(str(error))}"
                 )
 
-    await asyncio.gather(
-        *(consume(session, sp, dp, lane) for session, sp, dp, lane in lanes)
-    )
+    await asyncio.gather(*(consume(relay) for relay in relays))
 
 
 async def resolve_destination(
@@ -2501,6 +2562,37 @@ async def verified_dest_peer(
     return peer
 
 
+async def pick_reader(
+    owner: Worker,
+    pool: Sequence[Worker],
+    source: types.Chat | types.Channel,
+    entry_link: str | None,
+    probe_ids: Sequence[int],
+) -> tuple[Worker | None, Any]:
+    """Choose the one account that will read this source, Premium first.
+
+    Only this account needs to see the source, and Telegram does not meter a
+    Premium account's download speed, so a Premium session is the best reader
+    even when other accounts could also reach the chat.
+    """
+    ordered = [s for s in pool if s.premium] + [s for s in pool if not s.premium]
+    for candidate in ordered:
+        if candidate.user_id == owner.user_id:
+            try:
+                peer = await owner.client.get_input_entity(to_peer(source))
+            except (RPCError, ValueError, TypeError):
+                continue
+            if await can_read_source(owner.client, peer, probe_ids):
+                return candidate, peer
+            continue
+        peer = await worker_source_peer(
+            owner, candidate, source, entry_link, probe_ids
+        )
+        if peer is not None:
+            return candidate, peer
+    return None, None
+
+
 async def run_group(
     pool: list[Worker],
     brand: str,
@@ -2585,22 +2677,32 @@ async def run_group(
             console.print(f"[dim]{escape(plan.title)} · nothing new[/dim]")
             continue
 
-        entry_link = None
-        roster: list[tuple[Worker, Any, Any]] = []
-        inviters: list[Worker] = [owner]
+        probe_ids = [message_id for message_id, _size in plan.pending]
+        entry_link = (
+            await source_entry_link(owner.client, plan.source)
+            if len(pool) > 1
+            else None
+        )
+        reader, reader_source = await pick_reader(
+            owner, pool, plan.source, entry_link, probe_ids
+        )
+        if reader is None or reader_source is None:
+            plan.error = "No signed-in account can read this source."
+            console.print(f"[red]{escape(plan.title)}: {plan.error}[/red]")
+            eta.drop_many(size for _id, size in plan.pending)
+            dashboard.retotal()
+            continue
 
-        if len(pool) > 1:
-            entry_link = await source_entry_link(owner.client, plan.source)
-        for worker in pool[1:]:
-            # A worker has to reach both ends: read the source and post here.
-            source_peer = await worker_source_peer(
-                owner,
-                worker,
-                plan.source,
-                entry_link,
-                [message_id for message_id, _size in plan.pending],
-            )
-            if source_peer is None:
+        # Uploaders need no access to the source at all: they are handed raw
+        # bytes. They only have to be anonymous admins of the destination. With
+        # other accounts available the reader is left to do nothing but read.
+        candidates = [s for s in pool if s.user_id != reader.user_id] or [reader]
+        uploaders: list[tuple[Worker, Any]] = []
+        inviters: list[Worker] = [owner]
+        for worker in candidates:
+            if worker.user_id == owner.user_id:
+                # The owner created the group, so its handle is already good.
+                uploaders.append((worker, destination))
                 continue
             attached = await attach_worker_to_group(
                 cast(Any, inviters), worker, primary, channel_id, result.invite_link
@@ -2609,13 +2711,11 @@ async def run_group(
                 worker.last_error = "could not be added to the backup group"
                 console.print(
                     f"[yellow]{worker.label} could not be added to "
-                    f"{escape(result.title)} (owner invite and self-join both "
-                    f"failed); it sits this group out.[/yellow]"
+                    f"{escape(result.title)}; it sits this group out.[/yellow]"
                 )
                 continue
-            # Anonymity is not optional: a worker that could not be promoted
-            # would be credited by name and user id on every video it sent, so
-            # it is kept out of the roster rather than allowed to post openly.
+            # Anonymity is not optional: an unpromoted account would be
+            # credited by name and user id on every video it sent.
             if not await promote_anonymous(owner.client, destination, worker):
                 console.print(
                     f"[yellow]{worker.label} is not anonymous here, so it will "
@@ -2633,65 +2733,71 @@ async def run_group(
                     f"sits this group out.[/yellow]"
                 )
                 continue
-            roster.append((worker, source_peer, dest_peer))
+            uploaders.append((worker, dest_peer))
+
+        if not uploaders:
+            console.print(
+                f"[yellow]No worker could post into {escape(result.title)}; "
+                f"{reader.label} will upload as well as read.[/yellow]"
+            )
+            if not reader.anonymous:
+                console.print(
+                    f"[yellow]Note: {reader.label} is not anonymous here, so "
+                    f"its videos will be credited to it.[/yellow]"
+                )
+            uploaders = [(reader, destination)]
 
         now = time.monotonic()
-        ready = [item for item in roster if item[0].cooldown_until <= now]
+        ready = [item for item in uploaders if item[0].cooldown_until <= now]
         if not ready:
-            if roster:
-                console.print(
-                    "[yellow]Every worker is cooling down; the owner will post "
-                    "this source.[/yellow]"
-                )
-            elif len(pool) > 1:
-                console.print(
-                    "[yellow]No worker could reach this source and group; the "
-                    "owner will post it.[/yellow]"
-                )
-            try:
-                owner_source = await owner.client.get_input_entity(to_peer(plan.source))
-            except (RPCError, ValueError, TypeError) as error:
-                plan.error = f"Owner cannot read the source: {error}"
-                console.print(f"[red]{escape(plan.error)}[/red]")
-                eta.drop_many(size for _id, size in plan.pending)
-                dashboard.retotal()
-                continue
-            if not owner.anonymous:
-                console.print(
-                    "[yellow]Note: the owner is not anonymous in this group, so "
-                    "the videos it posts here will be credited to it.[/yellow]"
-                )
-            ready = [(owner, owner_source, destination)]
+            console.print(
+                "[yellow]Every uploader is cooling down; leaving this source "
+                "for a rerun.[/yellow]"
+            )
+            eta.drop_many(size for _id, size in plan.pending)
+            dashboard.retotal()
+            continue
 
-        # Each account gets several slots, so the connections stay busy while
-        # one video is finishing and the next is starting. Every slot needs its
-        # own progress row.
-        assigned: list[tuple[Worker, Any, Any, TaskID]] = []
-        for session, source_peer, dest_peer in ready:
+        relays: list[Relay] = []
+        for worker, dest_peer in ready:
             for slot in range(slots):
-                label = session.label if slots == 1 else f"{session.label}.{slot + 1}"
-                assigned.append(
-                    (session, source_peer, dest_peer, dashboard.lane(label))
+                label = worker.label if slots == 1 else f"{worker.label}.{slot + 1}"
+                relays.append(
+                    Relay(
+                        reader=reader,
+                        uploader=worker,
+                        source_peer=reader_source,
+                        dest_peer=dest_peer,
+                        lane=dashboard.lane(
+                            label
+                            if reader.user_id == worker.user_id
+                            else f"{reader.label}→{label}"
+                        ),
+                    )
                 )
         result.posters = sorted(
-            {*result.posters, *(session.label for session, _s, _d, _l in assigned)}
+            {*result.posters, *(relay.uploader.label for relay in relays)}
         )
-        posting = ", ".join(sorted({s.label for s, _s, _d, _l in assigned}))
+        badge = " (premium, unmetered)" if reader.premium else ""
         console.print(
             f"[dim]{escape(plan.title)} · {len(plan.pending)} video(s) · "
-            f"posting via {posting} · {slots} at a time each · "
-            f"{transfer_connections()} connections per video[/dim]"
+            f"reading via {reader.label}{badge} · uploading via "
+            f"{', '.join(sorted({w.label for w, _d in ready}))}[/dim]"
+        )
+        console.print(
+            f"[dim]{reader_connections(reader)} download lane(s) · "
+            f"{transfer_connections()} upload lane(s) per account[/dim]"
         )
         pointer = PointerState(
             allowed=not bool(getattr(plan.source, "noforwards", False))
         )
         try:
             await copy_plan(
-                assigned, plan, temp_dir, state, eta, dashboard, result, pointer
+                relays, plan, temp_dir, state, eta, dashboard, result, pointer
             )
         finally:
-            for _session, _sp, _dp, lane in assigned:
-                dashboard.transfer.remove_task(lane)
+            for relay in relays:
+                dashboard.transfer.remove_task(relay.lane)
 
     return result
 
