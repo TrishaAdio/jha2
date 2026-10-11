@@ -156,17 +156,21 @@ THUMB_MAX_BYTES = 200 * 1024
 # Generated thumbnails are capped at this width; Telegram's own video previews
 # are 320px, and a larger one only wastes an upload.
 THUMB_WIDTH = 320
-# Connections carrying one file. Telegram throttles a single connection to
-# roughly 1 MB/s no matter how much bandwidth is free, so this is the main
-# speed dial: 8 lanes is about 8x one lane. Raise it on a fast host with
-# FINAL_CONNECTIONS; too high invites FloodWait instead of more speed.
-DEFAULT_CONNECTIONS = 8
-MAX_CONNECTIONS = 32
-# Videos one account copies at the same time. Each still uses every connection,
-# so this mainly keeps the pipe busy while one video finishes and the next
-# starts.
-DEFAULT_PARALLEL_VIDEOS = 2
-MAX_PARALLEL_VIDEOS = 8
+# Connections carrying one file, per direction. Telegram meters each *account*,
+# not each socket, so this helps only up to a point: past it the same bandwidth
+# is split more ways and Telegram starts throttling, which shows up as speeds
+# that sag the longer a run goes. Four is a sane plateau; FINAL_CONNECTIONS can
+# change it, but more worker accounts is what actually scales a run.
+DEFAULT_CONNECTIONS = 4
+MAX_CONNECTIONS = 16
+# Videos one account copies at the same time. These share the account's
+# connections rather than adding any, so raising it makes each video slower
+# without making the run faster. One keeps the per-video ETA honest.
+DEFAULT_PARALLEL_VIDEOS = 1
+MAX_PARALLEL_VIDEOS = 4
+# Telegram's ceiling for a single downloaded file part. Uploads are capped at
+# PART_SIZE (512 KiB), so one download feeds exactly two uploads.
+DOWNLOAD_PART = 1024 * 1024
 # A worker that keeps failing is ejected after this many consecutive errors, so
 # a broken account cannot drain the queue and fail every video in it.
 MAX_CONSECUTIVE_FAILURES = 3
@@ -1661,67 +1665,99 @@ async def stream_copy(
     size: int,
     progress: Callable[[int], None],
 ) -> types.InputFileBig:
-    """Move a file straight from the source to Telegram without touching disk.
+    """Move a file from the source straight back up, without touching disk.
 
-    Each pipeline fetches one 512 KiB part and immediately pushes it back up, so
-    downloading and uploading overlap instead of running one after the other.
-    That alone halves the time per video, and nothing is written to disk, which
-    matters when several accounts each handle a large file at once.
+    Fetchers and pushers are independent and meet at a bounded queue, so both
+    directions run at once. Doing the two inside one lane (fetch, then push,
+    then fetch) leaves each connection idle half the time, which is most of why
+    throughput was poor.
 
-    512 KiB is the part size because Telegram needs a download limit that
-    divides 1 MiB and an upload part of at most 512 KiB, so one size satisfies
-    both and every downloaded part maps to exactly one uploaded part.
+    Downloads use 1 MiB, Telegram's ceiling for a file part, while uploads use
+    the 512 KiB it caps big-file parts at, so each download feeds exactly two
+    uploads and a slow link pays half as many download round trips.
+
+    The queue is bounded, which is what stops a fast source from reading the
+    whole file into memory while the uploads lag behind.
     """
     dc_id, location = utils.get_input_location(document)
-    total_parts = math.ceil(size / PART_SIZE)
-    if total_parts > MAX_UPLOAD_PARTS:
+    total_up = math.ceil(size / PART_SIZE)
+    total_down = math.ceil(size / DOWNLOAD_PART)
+    if total_up > MAX_UPLOAD_PARTS:
         raise RuntimeError(
-            f"{human_size(size)} needs {total_parts} parts, over Telegram's "
+            f"{human_size(size)} needs {total_up} parts, over Telegram's "
             f"{MAX_UPLOAD_PARTS} limit."
         )
     file_id = helpers.generate_random_long()
     download = await transport.download_senders(dc_id)
     upload = await transport.upload_senders()
-    lanes = min(len(download), len(upload), total_parts) or 1
+    fetchers = min(len(download), total_down) or 1
+    pushers = min(len(upload), total_up) or 1
+    per_download = DOWNLOAD_PART // PART_SIZE
+    queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(
+        maxsize=max(4, pushers * 2)
+    )
     moved = 0
     guard = asyncio.Lock()
 
-    async def pipeline(start: int) -> None:
-        nonlocal moved
-        down_sender = download[start]
-        up_sender = upload[start]
-        part = start
-        while part < total_parts:
-            offset = part * PART_SIZE
+    async def fetch(start: int) -> None:
+        sender = download[start]
+        index = start
+        while index < total_down:
+            offset = index * DOWNLOAD_PART
             fetched = await call_part(
                 transport.client,
-                down_sender,
-                GetFileRequest(location, offset=offset, limit=PART_SIZE),
-                f"stream down part {part}",
+                sender,
+                GetFileRequest(location, offset=offset, limit=DOWNLOAD_PART),
+                f"stream down {index}",
             )
-            chunk = getattr(fetched, "bytes", b"")
-            if not chunk:
+            data = getattr(fetched, "bytes", b"")
+            if not data:
                 raise RuntimeError(
-                    f"Telegram returned no data for part {part} of {name}."
+                    f"Telegram returned no data at {offset} of {name}."
                 )
+            base = index * per_download
+            for cursor in range(0, len(data), PART_SIZE):
+                await queue.put(
+                    (base + cursor // PART_SIZE, data[cursor : cursor + PART_SIZE])
+                )
+            index += fetchers
+
+    async def push(sender: Any) -> None:
+        nonlocal moved
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            part, data = item
             await call_part(
                 transport.client,
-                up_sender,
+                sender,
                 SaveBigFilePartRequest(
                     file_id=file_id,
                     file_part=part,
-                    file_total_parts=total_parts,
-                    bytes=chunk,
+                    file_total_parts=total_up,
+                    bytes=data,
                 ),
-                f"stream up part {part}",
+                f"stream up {part}",
             )
             async with guard:
-                moved += len(chunk)
+                moved += len(data)
                 progress(moved)
-            part += lanes
 
-    await asyncio.gather(*(pipeline(index) for index in range(lanes)))
-    return types.InputFileBig(id=file_id, parts=total_parts, name=name)
+    fetch_tasks = [asyncio.create_task(fetch(index)) for index in range(fetchers)]
+    push_tasks = [asyncio.create_task(push(upload[index])) for index in range(pushers)]
+    try:
+        await asyncio.gather(*fetch_tasks)
+        # Every byte is queued, so release the pushers once they have drained it.
+        for _ in push_tasks:
+            await queue.put(None)
+        await asyncio.gather(*push_tasks)
+    except BaseException:
+        for task in (*fetch_tasks, *push_tasks):
+            task.cancel()
+        await asyncio.gather(*fetch_tasks, *push_tasks, return_exceptions=True)
+        raise
+    return types.InputFileBig(id=file_id, parts=total_up, name=name)
 
 
 async def pooled_download(
@@ -1737,7 +1773,9 @@ async def pooled_download(
     since ffmpeg needs a real file to read a frame out of.
     """
     dc_id, location = utils.get_input_location(document)
-    total_parts = math.ceil(size / PART_SIZE)
+    # 1 MiB is Telegram's ceiling for one part, so this is half the round trips
+    # of a 512 KiB read.
+    total_parts = math.ceil(size / DOWNLOAD_PART)
     senders = await transport.download_senders(dc_id)
     lanes = min(len(senders), total_parts) or 1
     handle = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1750,11 +1788,11 @@ async def pooled_download(
         sender = senders[start]
         part = start
         while part < total_parts:
-            offset = part * PART_SIZE
+            offset = part * DOWNLOAD_PART
             fetched = await call_part(
                 transport.client,
                 sender,
-                GetFileRequest(location, offset=offset, limit=PART_SIZE),
+                GetFileRequest(location, offset=offset, limit=DOWNLOAD_PART),
                 f"download part {part}",
             )
             chunk = getattr(fetched, "bytes", b"")
@@ -2132,8 +2170,11 @@ async def copy_video(
     finally:
         if media_path is not None:
             media_path.unlink(missing_ok=True)
-        dashboard.transfer.update(
-            lane, description=f"{session.label} idle", completed=0, total=None
+        dashboard.transfer.reset(
+            lane,
+            description=f"{session.label} idle",
+            total=None,
+            start=False,
         )
 
 
